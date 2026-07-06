@@ -160,16 +160,18 @@ def parse_empion(xlsx_bytes):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_emp(name, date, emp_idx):
+    """Returns (empion_record, match_type, note, confidence_0_to_1)"""
     n = norm(name)
     # 1. Exact
     if (n, date) in emp_idx:
-        return emp_idx[(n, date)], 'exact', None
+        return emp_idx[(n, date)], 'exact', None, 1.0
     # 2. Drop middle name (keep first + last word only)
     parts = n.split()
     if len(parts) >= 3:
         short = f"{parts[0]} {parts[-1]}"
         if (short, date) in emp_idx:
-            return emp_idx[(short, date)], 'middle-name-stripped', f"'{name}' matched as '{emp_idx[(short,date)]['name']}'"
+            matched = emp_idx[(short, date)]
+            return matched, 'middle-name-stripped', f"'{name}' matched as '{matched['name']}' (middle name removed)", 0.95
     # 3. Fuzzy match across all names on same date
     date_keys = [k for k in emp_idx if k[1] == date]
     if date_keys:
@@ -179,8 +181,9 @@ def find_emp(name, date, emp_idx):
             match_key = (close[0], date)
             score = difflib.SequenceMatcher(None, n, close[0]).ratio()
             label = 'fuzzy-auto' if score >= 0.85 else 'fuzzy-review'
-            return emp_idx[match_key], label, f"'{name}' fuzzy-matched to '{emp_idx[match_key]['name']}' ({score:.0%})"
-    return None, 'no-match', None
+            matched = emp_idx[match_key]
+            return matched, label, f"'{name}' fuzzy-matched to '{matched['name']}' ({score:.0%})", score
+    return None, 'no-match', None, 0.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RECONCILIATION ENGINE
@@ -194,9 +197,9 @@ def reconcile(shifts, emp_idx):
         if lc:
             rows.append({**s, 'e_in': None, 'e_out': None, 'e_raw': None, 'e_adj': None,
                           'start_diff': None, 'end_diff': None, 'hrs_diff': None,
-                          'flag': 'LATE CANCEL', 'notes': '', 'match_type': 'lc'})
+                          'flag': 'LATE CANCEL', 'notes': '', 'match_type': 'lc', 'confidence': None})
             continue
-        m, match_type, match_note = find_emp(emp, date, emp_idx)
+        m, match_type, match_note, name_confidence = find_emp(emp, date, emp_idx)
         notes = []
         if match_note:
             notes.append(match_note)
@@ -206,7 +209,7 @@ def reconcile(shifts, emp_idx):
         if not m:
             rows.append({**s, 'e_in': None, 'e_out': None, 'e_raw': None, 'e_adj': None,
                           'start_diff': None, 'end_diff': None, 'hrs_diff': None,
-                          'flag': 'NO PUNCH', 'notes': '; '.join(notes), 'match_type': 'no-match'})
+                          'flag': 'NO PUNCH', 'notes': '; '.join(notes), 'match_type': 'no-match', 'confidence': 0.0})
             continue
         if m['split']:
             notes.append(f"Split punch ({len(m['entries'])} entries combined)")
@@ -221,10 +224,13 @@ def reconcile(shifts, emp_idx):
         if worked_brk:  flag = 'WORKED BREAK'
         if m['raw'] < 1.0: flag = 'BAD PUNCH'
         if match_type == 'fuzzy-review': flag = f'REVIEW NAME MATCH | {flag}'
+        # Overall confidence: name match score, reduced if hours are off
+        hrs_penalty = min(abs(hrs_diff) / 12, 0.3) if hrs_diff else 0  # up to 30% penalty
+        confidence = round(max(0.0, name_confidence - hrs_penalty), 2)
         rows.append({**s, 'e_in': m['in'], 'e_out': m['out'], 'e_raw': m['raw'],
                      'e_adj': m['adj'], 'start_diff': start_diff, 'end_diff': end_diff,
                      'hrs_diff': hrs_diff, 'flag': flag, 'notes': '; '.join(notes),
-                     'match_type': match_type})
+                     'match_type': match_type, 'confidence': confidence})
     return rows, name_notes
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -418,7 +424,9 @@ def build_flags_excel(meta, recon_rows):
             c = ws2.cell(row=ri2, column=col, value=val)
             c.fill = fill; c.alignment = aln or S['CTR']; c.font = fnt or S['NF']
             if fmt and val is not None: c.number_format = fmt
-        note_val = r['flag'] + (' | ' + r['notes'] if r['notes'] else '')
+        conf = r.get('confidence')
+        conf_str = f" | Confidence: {conf:.0%}" if conf is not None else ""
+        note_val = r['flag'] + conf_str + (' | ' + r['notes'] if r['notes'] else '')
         cv2(1, r['date']); cv2(2, r['emp'], aln=S['LFT']); cv2(3, r['role']); cv2(4, r['shift'])
         cv2(5, r['start'], S['TFmt']); cv2(6, r['end'], S['TFmt'])
         cv2(7, i_gross, "0.00"); cv2(8, r['inv_hrs'], "0.00", fnt=S['BF'])
@@ -500,11 +508,17 @@ if pdf_file and xlsx_file:
             import pandas as pd
             def fmt_dt(v):
                 return v.strftime("%-m/%-d %-I:%M %p") if v else "—"
+            def conf_label(c):
+                if c is None: return "—"
+                if c >= 0.95: return f"✅ {c:.0%}"
+                if c >= 0.80: return f"🟡 {c:.0%}"
+                return f"🔴 {c:.0%}"
             table_data = [{
                 "Date":       r['date'],
                 "Employee":   r['emp'],
                 "Role":       r['role'],
                 "Issue":      r['flag'],
+                "Confidence": conf_label(r.get('confidence')),
                 "Inv In":     fmt_dt(r['start']),
                 "Inv Out":    fmt_dt(r['end']),
                 "Emp In":     fmt_dt(r['e_in']),
