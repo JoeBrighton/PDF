@@ -692,6 +692,12 @@ def ocr_intact_screenshot(img_bytes):
     try:
         import pytesseract
         from PIL import Image
+        import subprocess
+        # verify tesseract binary is accessible
+        result = subprocess.run(['tesseract', '--version'], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Tesseract binary not found: {result.stderr}")
+        pytesseract.pytesseract.tesseract_cmd = 'tesseract'
         img = Image.open(io.BytesIO(img_bytes))
         data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME)
         import pandas as pd
@@ -740,8 +746,8 @@ def ocr_intact_screenshot(img_bytes):
             })
         return img, result
 
-    except Exception:
-        return None, []
+    except Exception as e:
+        return None, [{'_error': str(e)}]
 
 
 def annotate_screenshot(img, matched_row_tops, img_width):
@@ -786,7 +792,8 @@ with tab2:
                 img, intact_rows = ocr_intact_screenshot(intact_file.read())
 
             if img is None:
-                st.error("Tesseract OCR not available. Make sure packages.txt (containing 'tesseract-ocr') is in your GitHub repo and the app has redeployed.")
+                err = intact_rows[0].get('_error', 'unknown') if intact_rows else 'unknown'
+                st.error(f"OCR failed: {err}")
             else:
                 with st.spinner("Matching..."):
                     matches = match_intact_to_bank(intact_rows, bank_txns)
@@ -939,7 +946,7 @@ with tab1:
             with d2:
                 flags_bytes = build_flags_excel(meta, recon_rows)
                 st.download_button(
-                    "Flags & Punch-for-Punch (Excel)",
+                     "Flags & Punch-for-Punch (Excel)",
                     data=flags_bytes,
                     file_name=f"{fac_slug}_{inv_slug}_Flags.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -947,3 +954,4 @@ with tab1:
                 )
     else:
         st.info("Upload both files above to get started.")
+d both files above to get started.")
