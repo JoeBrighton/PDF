@@ -613,14 +613,19 @@ if pdf_file and xlsx_file:
         c5.metric("⚠️ Other",       n_other)
         c6.metric("⬜ Late Cancel", n_lc)
 
-        total_inv_hrs  = sum(r['inv_hrs'] for r in recon_rows if not r['lc'])
-        total_emp_hrs  = sum(r['e_adj'] for r in recon_rows if r['e_adj'] is not None)
-        hrs_delta      = round(total_inv_hrs - total_emp_hrs, 2)
-        delta_str      = f"{hrs_delta:+.2f}h"
-        hc1, hc2, hc3 = st.columns(3)
-        hc1.metric("📋 Total Invoice Hours",  f"{total_inv_hrs:.2f}h")
-        hc2.metric("🕐 Total Empion Hours",   f"{total_emp_hrs:.2f}h")
-        hc3.metric("Δ Hours Difference",      delta_str, delta=delta_str)
+        total_inv_hrs   = sum(r['inv_hrs'] for r in recon_rows if not r['lc'])
+        total_emp_hrs   = sum(r['e_adj'] for r in recon_rows if r['e_adj'] is not None)
+        punch_disc_hrs  = round(sum(r['hrs_diff'] for r in recon_rows if r.get('hrs_diff') is not None), 2)
+        missing_hrs     = round(sum(r['inv_hrs'] for r in recon_rows if r['match_type'] == 'no-match'), 2)
+
+        hc1, hc2, hc3, hc4 = st.columns(4)
+        hc1.metric("Total Invoice Hours",    f"{total_inv_hrs:.2f}h")
+        hc2.metric("Total Empion Hours",     f"{total_emp_hrs:.2f}h")
+        disc_str = f"{punch_disc_hrs:+.2f}h"
+        hc3.metric("Punch Discrepancy",      disc_str, delta=disc_str,
+                   help="Sum of hour differences on shifts where an Empion punch was found but hours don't match")
+        hc4.metric("Missing Punch Hours",    f"{missing_hrs:.2f}h",
+                   help="Invoice hours with no matching Empion punch at all")
 
         # ── Name matching notes ───────────────────────────────────────────
         if name_notes:
