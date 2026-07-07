@@ -11,9 +11,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Clipboard Invoice Reconciliation", layout="wide")
-st.title("Clipboard Invoice Reconciliation")
-st.caption("Upload a Clipboard invoice PDF and an Empion punch report to generate the reconciliation.")
+st.set_page_config(page_title="Staffing Invoice Reconciliation", layout="wide")
+st.title("Staffing Invoice Reconciliation")
+st.caption("Upload a Clipboard or ShiftKey invoice PDF and an Empion punch report to generate the reconciliation.")
 st.info(
     "🔒 **Privacy:** Uploaded files are processed in memory only and never stored. "
     "All data is discarded when you close the browser or upload new files. "
@@ -38,8 +38,90 @@ def norm_role(r):
     return "CMA" if "CERTIFIED" in r else r
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INVOICE PARSER
+# INVOICE PARSER — auto-detects vendor
 # ─────────────────────────────────────────────────────────────────────────────
+
+def parse_invoice(pdf_bytes):
+    """Detects vendor and routes to the correct parser. Returns (meta, shifts)."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes); tmp_path = tmp.name
+    try:
+        with pdfplumber.open(tmp_path) as pdf:
+            first_page = pdf.pages[0].extract_text() or ""
+    finally:
+        os.unlink(tmp_path)
+    if "ShiftKey" in first_page:
+        return parse_shiftkey_invoice(pdf_bytes)
+    return parse_clipboard_invoice(pdf_bytes)
+
+def parse_shiftkey_invoice(pdf_bytes):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes); tmp_path = tmp.name
+    try:
+        with pdfplumber.open(tmp_path) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    finally:
+        os.unlink(tmp_path)
+
+    inv_m    = re.search(r'Invoice\s+(?:Number|#)\s*(\S+)', text)
+    fac_m    = re.search(r'ShiftKey,\s+LLC\.\s+Invoice\s*\n(.+)', text)
+    period_m = re.search(r'Invoice Period\s+([\w\s,]+?\d{4})\s+-\s+([\w\s,]+?\d{4})', text)
+    bal_m    = re.search(r'Balance Due\s+\$([\d,]+\.\d{2})', text)
+
+    def _parse_sk_date(s):
+        s = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', s.strip())
+        return datetime.strptime(s, "%b %d, %Y")
+
+    def _infer_shift(hour):
+        if 6 <= hour < 14:  return "AM"
+        if 14 <= hour < 19: return "PM"
+        return "NOC"
+
+    meta = {
+        'invoice':      inv_m.group(1) if inv_m else '',
+        'facility':     fac_m.group(1).strip() if fac_m else '',
+        'period_start': _parse_sk_date(period_m.group(1)).strftime("%m/%d/%Y") if period_m else '',
+        'period_end':   _parse_sk_date(period_m.group(2)).strftime("%m/%d/%Y") if period_m else '',
+        'balance_due':  float(bal_m.group(1).replace(',', '')) if bal_m else 0,
+        'vendor':       'ShiftKey',
+    }
+
+    MONTHS = r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*'
+    ITEM_RE = re.compile(
+        MONTHS + r'\s+\d+\w*,\s+\d{4}\s+'        # processed-on date (ignored)
+        r'(' + MONTHS + r'\s+\d+\w*,\s+\d{4})\s+' # shift date
+        r'(CNA|RN|LPN|LVN)\s+'
+        r'([A-Za-z\-\']+,\s+[A-Za-z\-\' ]+?)\s+'  # Last, First
+        r'(\d{2}:\d{2})\s+-\s+(\d{2}:\d{2})\s+'   # HH:MM - HH:MM
+        r'(\d+)m\s+'                                # break minutes
+        r'[\d\s hm]+\s+'                            # duration text (e.g. "7h 30m")
+        r'([\d.]+)\s+'                              # hours decimal
+        r'\$([\d.]+)\s+'                            # rate
+        r'\$([\d,]+\.\d{2})'                        # total
+    )
+
+    shifts = []
+    for m in ITEM_RE.finditer(text):
+        shift_dt = _parse_sk_date(m.group(1))
+        date = shift_dt.strftime("%m/%d")
+        role = m.group(2)
+        parts = m.group(3).split(',', 1)
+        emp = f"{parts[1].strip()} {parts[0].strip()}" if len(parts) == 2 else m.group(3).strip()
+        t_in_str, t_out_str = m.group(4), m.group(5)
+        t_in  = datetime.strptime(f"{shift_dt.strftime('%m/%d/%Y')} {t_in_str}", "%m/%d/%Y %H:%M")
+        t_out = datetime.strptime(f"{shift_dt.strftime('%m/%d/%Y')} {t_out_str}", "%m/%d/%Y %H:%M")
+        if t_out <= t_in:
+            from datetime import timedelta
+            t_out += timedelta(days=1)
+        inv_hrs = float(m.group(7))  # already break-deducted by ShiftKey
+        rate = float(m.group(8))
+        shift_label = _infer_shift(t_in.hour)
+        shifts.append({
+            'date': date, 'role': role, 'emp': emp, 'shift': shift_label,
+            'lc': False, 'worked_brk': False, 'inv_hrs': inv_hrs, 'rate': rate,
+            'start': t_in, 'end': t_out,
+        })
+    return meta, shifts
 
 def parse_clipboard_invoice(pdf_bytes):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -63,6 +145,7 @@ def parse_clipboard_invoice(pdf_bytes):
         'period_start': period_s.group(1) if period_s else '',
         'period_end':   period_e.group(1) if period_e else '',
         'balance_due':  float(balance.group(1).replace(',', '')) if balance else 0,
+        'vendor':       'Clipboard',
     }
 
     ROLES = r'(CNA|RN|LPN|LVN|RN/DON|CERTIFIED MEDICATION AIDE)'
@@ -461,14 +544,15 @@ def build_flags_excel(meta, recon_rows):
 
 col1, col2 = st.columns(2)
 with col1:
-    pdf_file  = st.file_uploader("📄 Clipboard Invoice (PDF)", type="pdf")
+    pdf_file  = st.file_uploader("📄 Invoice PDF (Clipboard or ShiftKey)", type="pdf")
 with col2:
     xlsx_file = st.file_uploader("📊 Empion Punch Report (Excel)", type=["xlsx", "xls"])
 
 if pdf_file and xlsx_file:
     if st.button("▶  Run Reconciliation", type="primary", use_container_width=True):
-        with st.spinner("Parsing invoice..."):
-            meta, shifts = parse_clipboard_invoice(pdf_file.read())
+        with st.spinner("Detecting vendor and parsing invoice..."):
+            meta, shifts = parse_invoice(pdf_file.read())
+            vendor = meta.get('vendor', 'Clipboard')
         with st.spinner("Parsing Empion punches..."):
             emp_idx = parse_empion(xlsx_file.read())
         with st.spinner("Reconciling..."):
@@ -476,7 +560,7 @@ if pdf_file and xlsx_file:
 
         # ── Summary stats ─────────────────────────────────────────────────
         st.divider()
-        st.subheader(f"Invoice {meta['invoice']} — {meta['facility']}")
+        st.subheader(f"{vendor} Invoice {meta['invoice']} — {meta['facility']}")
         st.caption(f"Period: {meta['period_start']} – {meta['period_end']}  |  Balance Due: ${meta['balance_due']:,.2f}")
 
         total_items = len(recon_rows)
