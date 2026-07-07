@@ -11,8 +11,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Staffing Invoice Reconciliation", layout="wide")
-st.title("Staffing Invoice Reconciliation")
+st.set_page_config(page_title="Brighton Healthcare Tools", layout="wide")
+st.title("Brighton Healthcare Tools")
 st.caption("Upload a Clipboard or ShiftKey invoice PDF and an Empion punch report to generate the reconciliation.")
 st.info(
     "🔒 **Privacy:** Uploaded files are processed in memory only and never stored. "
@@ -617,120 +617,334 @@ def build_flags_excel(meta, recon_rows):
     return buf.read()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AP PAYMENT RECONCILIATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_bank_statement(pdf_bytes):
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+    transactions = {}  # keyed by check_no for fast lookup
+
+    # ACH/electronic checks: "05/04 Ck# V225 Chrr Georgia-FLWhigham Opco L ACH.Live/V1cr 150.00"
+    CK_RE = re.compile(
+        r'(\d{2}/\d{2})\s+Ck#\s+V(\d+)\s+Chrr\s+(.+?)\s+(?:Whigham Opco L|ACH\.Live/\S+)\s+([\d,]+\.\d{2})'
+    )
+    for m in CK_RE.finditer(text):
+        transactions[m.group(2)] = {
+            'date': m.group(1), 'check_no': m.group(2),
+            'vendor_raw': m.group(3).strip(),
+            'amount': float(m.group(4).replace(',', '')),
+            'type': 'ACH',
+        }
+
+    # Wire transfers: "05/01 Wire TransferWhig Troy, LLC 27,500.00"
+    WIRE_RE = re.compile(r'(\d{2}/\d{2})\s+Wire Transfer(.+?)\s+([\d,]+\.\d{2})$', re.MULTILINE)
+    wire_idx = 1
+    for m in WIRE_RE.finditer(text):
+        key = f"WIRE_{wire_idx}"; wire_idx += 1
+        transactions[key] = {
+            'date': m.group(1), 'check_no': None,
+            'vendor_raw': m.group(2).strip(),
+            'amount': float(m.group(3).replace(',', '')),
+            'type': 'Wire',
+        }
+
+    # Paper checks section
+    in_checks = False
+    CHK_SEC_RE = re.compile(r'(\d{2}/\d{2})\s+(\d{3,})\s+([\d,]+\.\d{2})')
+    for line in text.split('\n'):
+        if line.strip().startswith('CHECKS') and 'CONTINUED' not in line: in_checks = True
+        if 'Total Checks' in line: in_checks = False
+        if in_checks:
+            for m in CHK_SEC_RE.finditer(line):
+                transactions[m.group(2)] = {
+                    'date': m.group(1), 'check_no': m.group(2),
+                    'vendor_raw': '', 'amount': float(m.group(3).replace(',', '')),
+                    'type': 'Check',
+                }
+    return transactions
+
+def match_intact_to_bank(intact_rows, bank_txns):
+    """
+    intact_rows: list of dicts with keys: check_no, amount, payee, row_index
+    Returns list of matched intact row_indexes.
+    """
+    matched = []
+    for row in intact_rows:
+        ck = str(row.get('check_no', '')).strip()
+        amt = row.get('amount')
+        # Primary: check number match
+        if ck and ck in bank_txns:
+            b = bank_txns[ck]
+            if amt is None or abs(b['amount'] - amt) < 0.02:
+                matched.append({'intact_row': row, 'bank': b, 'match_type': 'check_no'})
+                continue
+        # Fallback: amount + fuzzy vendor across all bank transactions
+        if amt:
+            for b in bank_txns.values():
+                if abs(b['amount'] - amt) < 0.02:
+                    matched.append({'intact_row': row, 'bank': b, 'match_type': 'amount'})
+                    break
+    return matched
+
+def ocr_intact_screenshot(img_bytes):
+    """OCR the Intact screenshot, return list of row dicts with bounding boxes."""
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(io.BytesIO(img_bytes))
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DATAFRAME)
+        import pandas as pd
+        data = data[data.conf > 30].dropna(subset=['text'])
+        data = data[data['text'].str.strip() != '']
+
+        # Group words into rows        # Group words into rows by Y coordinate (cluster within 8px)
+        data = data.sort_values('top')
+        rows = []
+        current_row_top = None
+        current_row_words = []
+
+        for _, word in data.iterrows():
+            if current_row_top is None or abs(word['top'] - current_row_top) > 8:
+                if current_row_words:
+                    rows.append(current_row_words)
+                current_row_words = [word]
+                current_row_top = word['top']
+            else:
+                current_row_words.append(word)
+
+        if current_row_words:
+            rows.append(current_row_words)
+
+        # Extract structured data from each row
+        result = []
+        AMT_RE = re.compile(r'^[\d,]+\.\d{2}$')
+        CK_RE  = re.compile(r'^\d{3,6}$')
+
+        for i, words in enumerate(rows):
+            texts = [w['text'] for w in words]
+            line  = ' '.join(texts)
+            top   = min(w['top'] for w in words)
+            bot   = max(w['top'] + w['height'] for w in words)
+
+            amounts = [float(t.replace(',', '')) for t in texts if AMT_RE.match(t)]
+            ck_nums = [t for t in texts if CK_RE.match(t)]
+
+            result.append({
+                'row_index': i,
+                'line': line,
+                'top': top,
+                'bottom': bot,
+                'check_no': ck_nums[0] if ck_nums else None,
+                'amount': amounts[0] if amounts else None,
+            })
+        return img, result
+
+    except ImportError:
+        return None, []
+
+
+def annotate_screenshot(img, matched_row_tops, img_width):
+    """Draw semi-transparent green highlights over matched rows."""
+    from PIL import Image, ImageDraw
+    overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    for top, bot in matched_row_tops:
+        draw.rectangle([(0, top - 2), (img_width, bot + 2)],
+                       fill=(0, 200, 80, 80))
+    base = img.convert('RGBA')
+    combined = Image.alpha_composite(base, overlay)
+    buf = io.BytesIO()
+    combined.convert('RGB').save(buf, format='PNG')
+    buf.seek(0)
+    return buf.read()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-col1, col2 = st.columns(2)
-with col1:
-    pdf_file  = st.file_uploader("📄 Invoice PDF (Clipboard or ShiftKey)", type="pdf")
-with col2:
-    xlsx_file = st.file_uploader("📊 Empion Punch Report (Excel)", type=["xlsx", "xls"])
+tab1, tab2 = st.tabs(["Staffing Invoice Recon", "AP Payment Recon"])
 
-if pdf_file and xlsx_file:
-    if st.button("▶  Run Reconciliation", type="primary", use_container_width=True):
-        with st.spinner("Detecting vendor and parsing invoice..."):
-            meta, shifts = parse_invoice(pdf_file.read())
-            vendor = meta.get('vendor', 'Clipboard')
-        with st.spinner("Parsing Empion punches..."):
-            emp_idx = parse_empion(xlsx_file.read())
-        with st.spinner("Reconciling..."):
-            recon_rows, name_notes = reconcile(shifts, emp_idx)
+with tab2:
+    st.subheader("AP Payment Reconciliation")
+    st.caption("Upload the Intact pending payments screenshot and your bank statement PDF to highlight cleared items.")
+    st.info("Files are processed in memory only and never stored.", icon=None)
 
-        # ── Summary stats ─────────────────────────────────────────────────
-        st.divider()
-        st.subheader(f"{vendor} Invoice {meta['invoice']} — {meta['facility']}")
-        st.caption(f"Period: {meta['period_start']} – {meta['period_end']}  |  Balance Due: ${meta['balance_due']:,.2f}")
+    ap1, ap2 = st.columns(2)
+    with ap1:
+        intact_file = st.file_uploader("Intact Screenshot (PNG or JPG)", type=["png", "jpg", "jpeg"], key="intact")
+    with ap2:
+        bank_file = st.file_uploader("Bank Statement (PDF)", type="pdf", key="bank")
 
-        total_items = len(recon_rows)
-        n_match  = sum(1 for r in recon_rows if r['flag'] == 'MATCH')
-        n_lc     = sum(1 for r in recon_rows if r['flag'] == 'LATE CANCEL')
-        n_np     = sum(1 for r in recon_rows if 'NO PUNCH' in r['flag'])
-        n_over   = sum(1 for r in recon_rows if 'OVERBILLED' in r['flag'])
-        n_under  = sum(1 for r in recon_rows if 'UNDERBILLED' in r['flag'])
-        n_other  = total_items - n_match - n_lc - n_np - n_over - n_under
+    if intact_file and bank_file:
+        if st.button("Run AP Reconciliation", type="primary", use_container_width=True):
+            with st.spinner("Parsing bank statement..."):
+                bank_txns = parse_bank_statement(bank_file.read())
 
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("✅ Match",       n_match)
-        c2.metric("🔴 No Punch",    n_np)
-        c3.metric("🟠 Overbilled",  n_over)
-        c4.metric("🟡 Underbilled", n_under)
-        c5.metric("⚠️ Other",       n_other)
-        c6.metric("⬜ Late Cancel", n_lc)
+            with st.spinner("Reading screenshot..."):
+                img, intact_rows = ocr_intact_screenshot(intact_file.read())
 
-        total_inv_hrs   = sum(r['inv_hrs'] for r in recon_rows if not r['lc'])
-        total_emp_hrs   = sum(r['e_adj'] for r in recon_rows if r['e_adj'] is not None)
-        punch_disc_hrs  = round(sum(r['hrs_diff'] for r in recon_rows if r.get('hrs_diff') is not None), 2)
-        missing_hrs     = round(sum(r['inv_hrs'] for r in recon_rows if r['match_type'] == 'no-match'), 2)
+            if img is None:
+                st.error("pytesseract not available on this server. Install tesseract to enable screenshot OCR.")
+            else:
+                with st.spinner("Matching..."):
+                    matches = match_intact_to_bank(intact_rows, bank_txns)
 
-        hc1, hc2, hc3, hc4 = st.columns(4)
-        hc1.metric("Total Invoice Hours",    f"{total_inv_hrs:.2f}h")
-        hc2.metric("Total Empion Hours",     f"{total_emp_hrs:.2f}h")
-        disc_str = f"{punch_disc_hrs:+.2f}h"
-        hc3.metric("Punch Discrepancy",      disc_str, delta=disc_str,
-                   help="Sum of hour differences on shifts where an Empion punch was found but hours don't match")
-        hc4.metric("Missing Punch Hours",    f"{missing_hrs:.2f}h",
-                   help="Invoice hours with no matching Empion punch at all")
+                matched_indices = {m['intact_row']['row_index'] for m in matches}
+                matched_tops = [
+                    (r['top'], r['bottom'])
+                    for r in intact_rows if r['row_index'] in matched_indices
+                ]
 
-        # ── Name matching notes ───────────────────────────────────────────
-        if name_notes:
-            with st.expander(f"⚠️ {len(name_notes)} name(s) matched with fuzzy/middle-name logic — review"):
-                for note in name_notes:
-                    st.write(f"• {note}")
+                st.divider()
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Bank transactions found", len(bank_txns))
+                mc2.metric("Intact rows scanned", len(intact_rows))
+                mc3.metric("Matched / cleared", len(matches))
 
-        # ── Flags table ───────────────────────────────────────────────────
-        flag_rows = [r for r in recon_rows if r['flag'] not in ('MATCH', 'LATE CANCEL')]
-        if flag_rows:
-            st.subheader(f"🚩 {len(flag_rows)} Items to Review")
-            import pandas as pd
-            def fmt_dt(v):
-                return v.strftime("%-m/%-d %-I:%M %p") if v else "—"
-            def conf_label(c):
-                if c is None: return "—"
-                if c >= 0.95: return f"✅ {c:.0%}"
-                if c >= 0.80: return f"🟡 {c:.0%}"
-                return f"🔴 {c:.0%}"
-            table_data = [{
-                "Date":       r['date'],
-                "Employee":   r['emp'],
-                "Role":       r['role'],
-                "Issue":      r['flag'],
-                "Confidence": conf_label(r.get('confidence')),
-                "Inv Hrs":    f"{r['inv_hrs']:.2f}",
-                "Emp Hrs":    f"{r['e_adj']:.2f}" if r['e_adj'] is not None else "—",
-                "Δ Hrs":      f"{r['hrs_diff']:+.2f}" if r['hrs_diff'] is not None else "—",                "Inv In":     fmt_dt(r['start']),
-                "Inv Out":    fmt_dt(r['end']),
-                "Emp In":     fmt_dt(r['e_in']),
-                "Emp Out":    fmt_dt(r['e_out']),
-                "Notes":      r['notes'],
-            } for r in flag_rows]
-            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
-        else:
-            st.success("All shifts matched — no issues found!")
+                if matches:
+                    with st.expander("Matched items"):
+                        import pandas as pd
+                        rows_display = [{
+                            "Check #":     m['intact_row']['check_no'] or "—",
+                            "Amount":      f"${m['bank']['amount']:,.2f}",
+                            "Bank Date":   m['bank']['date'],
+                            "Bank Vendor": m['bank']['vendor_raw'][:30],
+                            "Match Type":  m['match_type'],
+                        } for m in matches]
+                        st.dataframe(pd.DataFrame(rows_display), hide_index=True)
 
-        # Downloads
-        st.divider()
-        st.subheader("Download Reports")
-        inv_slug = meta['invoice'].replace('-', '_')
-        fac_slug = re.sub(r'[^a-zA-Z0-9]', '_', meta['facility'])[:20].strip('_')
+                with st.spinner("Annotating screenshot..."):
+                    annotated = annotate_screenshot(img, matched_tops, img.width)
 
-        d1, d2 = st.columns(2)
-        with d1:
-            hours_bytes = build_hours_excel(meta, shifts)
-            st.download_button(
-                "Hours by Employee (Excel)",
-                data=hours_bytes,
-                file_name=f"{fac_slug}_{inv_slug}_Hours.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        with d2:
-            flags_bytes = build_flags_excel(meta, recon_rows)
-            st.download_button(
-                "Flags & Punch-for-Punch (Excel)",
-                data=flags_bytes,
-                file_name=f"{fac_slug}_{inv_slug}_Flags.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-else:
-    st.info("Upload both files above to get started.")
+                st.image(annotated, caption="Green = cleared in bank statement", use_container_width=True)
+                st.download_button(
+                    "Download Annotated Screenshot",
+                    data=annotated,
+                    file_name="intact_reconciled.png",
+                    mime="image/png",
+                    use_container_width=True,
+                )
+    else:
+        st.info("Upload both files above to get started.")
+
+with tab1:
+    st.caption("Upload a Clipboard or ShiftKey invoice PDF and an Empion punch report to generate the reconciliation.")
+    st.info(
+        "Privacy: Uploaded files are processed in memory only and never stored. "
+        "All data is discarded when you close the browser or upload new files. "
+        "Nothing is saved to any server or database.",
+        icon=None,
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        pdf_file  = st.file_uploader("Invoice PDF (Clipboard or ShiftKey)", type="pdf")
+    with col2:
+        xlsx_file = st.file_uploader("Empion Punch Report (Excel)", type=["xlsx", "xls"])
+
+    if pdf_file and xlsx_file:
+        if st.button("Run Reconciliation", type="primary", use_container_width=True):
+            with st.spinner("Detecting vendor and parsing invoice..."):
+                meta, shifts = parse_invoice(pdf_file.read())
+                vendor = meta.get('vendor', 'Clipboard')
+            with st.spinner("Parsing Empion punches..."):
+                emp_idx = parse_empion(xlsx_file.read())
+            with st.spinner("Reconciling..."):
+                recon_rows, name_notes = reconcile(shifts, emp_idx)
+
+            st.divider()
+            st.subheader(f"{vendor} Invoice {meta['invoice']} -- {meta['facility']}")
+            st.caption(f"Period: {meta['period_start']} - {meta['period_end']}  |  Balance Due: ${meta['balance_due']:,.2f}")
+
+            total_items = len(recon_rows)
+            n_match  = sum(1 for r in recon_rows if r['flag'] == 'MATCH')
+            n_lc     = sum(1 for r in recon_rows if r['flag'] == 'LATE CANCEL')
+            n_np     = sum(1 for r in recon_rows if 'NO PUNCH' in r['flag'])
+            n_over   = sum(1 for r in recon_rows if 'OVERBILLED' in r['flag'])
+            n_under  = sum(1 for r in recon_rows if 'UNDERBILLED' in r['flag'])
+            n_other  = total_items - n_match - n_lc - n_np - n_over - n_under
+
+            c1, c2, c3, c4, c5, c6 = st.columns(6)
+            c1.metric("Match",       n_match)
+            c2.metric("No Punch",    n_np)
+            c3.metric("Overbilled",  n_over)
+            c4.metric("Underbilled", n_under)
+            c5.metric("Other",       n_other)
+            c6.metric("Late Cancel", n_lc)
+
+            total_inv_hrs  = sum(r['inv_hrs'] for r in recon_rows if not r['lc'])
+            total_emp_hrs  = sum(r['e_adj'] for r in recon_rows if r['e_adj'] is not None)
+            punch_disc_hrs = round(sum(r['hrs_diff'] for r in recon_rows if r.get('hrs_diff') is not None), 2)
+            missing_hrs    = round(sum(r['inv_hrs'] for r in recon_rows if r['match_type'] == 'no-match'), 2)
+
+            hc1, hc2, hc3, hc4 = st.columns(4)
+            hc1.metric("Total Invoice Hours", f"{total_inv_hrs:.2f}h")
+            hc2.metric("Total Empion Hours",  f"{total_emp_hrs:.2f}h")
+            disc_str = f"{punch_disc_hrs:+.2f}h"
+            hc3.metric("Punch Discrepancy",   disc_str, delta=disc_str)
+            hc4.metric("Missing Punch Hours", f"{missing_hrs:.2f}h")
+
+            if name_notes:
+                with st.expander(f"{len(name_notes)} name(s) matched with fuzzy/middle-name logic -- review"):
+                    for note in name_notes:
+                        st.write(f"* {note}")
+
+            flag_rows = [r for r in recon_rows if r['flag'] not in ('MATCH', 'LATE CANCEL')]
+            if flag_rows:
+                st.subheader(f"{len(flag_rows)} Items to Review")
+                import pandas as pd
+                def fmt_dt(v):
+                    return v.strftime("%-m/%-d %-I:%M %p") if v else "--"
+                def conf_label(c):
+                    if c is None: return "--"
+                    if c >= 0.95: return f"OK {c:.0%}"
+                    if c >= 0.80: return f"?? {c:.0%}"
+                    return f"!! {c:.0%}"
+                table_data = [{
+                    "Date":       r['date'],
+                    "Employee":   r['emp'],
+                    "Role":       r['role'],
+                    "Issue":      r['flag'],
+                    "Confidence": conf_label(r.get('confidence')),
+                    "Inv Hrs":    f"{r['inv_hrs']:.2f}",
+                    "Emp Hrs":    f"{r['e_adj']:.2f}" if r['e_adj'] is not None else "--",
+                    "Hrs Diff":   f"{r['hrs_diff']:+.2f}" if r['hrs_diff'] is not None else "--",
+                    "Inv In":     fmt_dt(r['start']),
+                    "Inv Out":    fmt_dt(r['end']),
+                    "Emp In":     fmt_dt(r['e_in']),
+                    "Emp Out":    fmt_dt(r['e_out']),
+                    "Notes":      r['notes'],
+                } for r in flag_rows]
+                st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+            else:
+                st.success("All shifts matched -- no issues found!")
+
+            st.divider()
+            st.subheader("Download Reports")
+            inv_slug = meta['invoice'].replace('-', '_')
+            fac_slug = re.sub(r'[^a-zA-Z0-9]', '_', meta['facility'])[:20].strip('_')
+
+            d1, d2 = st.columns(2)
+            with d1:
+                hours_bytes = build_hours_excel(meta, shifts)
+                st.download_button(
+                    "Hours by Employee (Excel)",
+                    data=hours_bytes,
+                    file_name=f"{fac_slug}_{inv_slug}_Hours.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with d2:
+                flags_bytes = build_flags_excel(meta, recon_rows)
+                st.download_button(
+                    "Flags & Punch-for-Punch (Excel)",
+                    data=flags_bytes,
+                    file_name=f"{fac_slug}_{inv_slug}_Flags.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+    else:
+        st.info("Upload both files above to get started.")
+ad both files above to get started.")
