@@ -2,3 +2,5 @@ streamlit
 pdfplumber
 openpyxl
 pandas
+pytesseract
+pillow
