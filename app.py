@@ -733,7 +733,9 @@ def ocr_intact_screenshot(img_bytes):
             top   = min(w['top'] for w in words)
             bot   = max(w['top'] + w['height'] for w in words)
 
-            amounts = [float(t.replace(',', '')) for t in texts if AMT_RE.match(t)]
+            # Rejoin comma-split amounts (OCR may split "2,382.30" into "2,382" + ".30")
+            rejoined = re.findall(r'[\d,]+\.\d{2}', ' '.join(texts))
+            amounts = [float(t.replace(',', '')) for t in rejoined if AMT_RE.match(t)]
             ck_nums = [t for t in texts if CK_RE.match(t)]
 
             result.append({
@@ -810,9 +812,14 @@ with tab2:
                 mc2.metric("Intact rows scanned", len(intact_rows))
                 mc3.metric("Matched / cleared", len(matches))
 
+                import pandas as pd
+                with st.expander("OCR debug — what was extracted from screenshot"):
+                    debug_rows = [{'Row': r['row_index'], 'Check#': r['check_no'], 'Amount': r['amount'], 'Line': r['line'][:80]}
+                                  for r in intact_rows if r.get('check_no') or r.get('amount')]
+                    st.dataframe(pd.DataFrame(debug_rows), hide_index=True)
+
                 if matches:
                     with st.expander("Matched items"):
-                        import pandas as pd
                         rows_display = [{
                             "Check #":     m['intact_row']['check_no'] or "—",
                             "Amount":      f"${m['bank']['amount']:,.2f}",
@@ -946,7 +953,7 @@ with tab1:
             with d2:
                 flags_bytes = build_flags_excel(meta, recon_rows)
                 st.download_button(
-                     "Flags & Punch-for-Punch (Excel)",
+                    "Flags & Punch-for-Punch (Excel)",
                     data=flags_bytes,
                     file_name=f"{fac_slug}_{inv_slug}_Flags.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
