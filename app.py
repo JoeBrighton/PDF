@@ -954,4 +954,3 @@ with tab1:
                 )
     else:
         st.info("Upload both files above to get started.")
-d both files above to get started.")
