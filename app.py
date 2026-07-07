@@ -290,9 +290,10 @@ def reconcile(shifts, emp_idx):
         if worked_brk:
             notes.append("Worked break — full gross billed")
         if not m:
+            flag = 'MICRO SHIFT' if inv_hrs < 1.0 else 'NO PUNCH'
             rows.append({**s, 'e_in': None, 'e_out': None, 'e_raw': None, 'e_adj': None,
                           'start_diff': None, 'end_diff': None, 'hrs_diff': None,
-                          'flag': 'NO PUNCH', 'notes': '; '.join(notes), 'match_type': 'no-match', 'confidence': 0.0})
+                          'flag': flag, 'notes': '; '.join(notes), 'match_type': 'no-match', 'confidence': 0.0})
             continue
         if m['split']:
             notes.append(f"Split punch ({len(m['entries'])} entries combined)")
@@ -307,9 +308,7 @@ def reconcile(shifts, emp_idx):
         if worked_brk:  flag = 'WORKED BREAK'
         if m['raw'] < 1.0: flag = 'BAD PUNCH'
         if match_type == 'fuzzy-review': flag = f'REVIEW NAME MATCH | {flag}'
-        # Overall confidence: name match score, reduced if hours are off
-        hrs_penalty = min(abs(hrs_diff) / 12, 0.3) if hrs_diff else 0  # up to 30% penalty
-        confidence = round(max(0.0, name_confidence - hrs_penalty), 2)
+        confidence = round(name_confidence, 2)
         rows.append({**s, 'e_in': m['in'], 'e_out': m['out'], 'e_raw': m['raw'],
                      'e_adj': m['adj'], 'start_diff': start_diff, 'end_diff': end_diff,
                      'hrs_diff': hrs_diff, 'flag': flag, 'notes': '; '.join(notes),
@@ -579,6 +578,15 @@ if pdf_file and xlsx_file:
         c5.metric("⚠️ Other",       n_other)
         c6.metric("⬜ Late Cancel", n_lc)
 
+        total_inv_hrs  = sum(r['inv_hrs'] for r in recon_rows if not r['lc'])
+        total_emp_hrs  = sum(r['e_adj'] for r in recon_rows if r['e_adj'] is not None)
+        hrs_delta      = round(total_inv_hrs - total_emp_hrs, 2)
+        delta_str      = f"{hrs_delta:+.2f}h"
+        hc1, hc2, hc3 = st.columns(3)
+        hc1.metric("📋 Total Invoice Hours",  f"{total_inv_hrs:.2f}h")
+        hc2.metric("🕐 Total Empion Hours",   f"{total_emp_hrs:.2f}h")
+        hc3.metric("Δ Hours Difference",      delta_str, delta=delta_str)
+
         # ── Name matching notes ───────────────────────────────────────────
         if name_notes:
             with st.expander(f"⚠️ {len(name_notes)} name(s) matched with fuzzy/middle-name logic — review"):
@@ -603,6 +611,9 @@ if pdf_file and xlsx_file:
                 "Role":       r['role'],
                 "Issue":      r['flag'],
                 "Confidence": conf_label(r.get('confidence')),
+                "Inv Hrs":    f"{r['inv_hrs']:.2f}",
+                "Emp Hrs":    f"{r['e_adj']:.2f}" if r['e_adj'] is not None else "—",
+                "Δ Hrs":      f"{r['hrs_diff']:+.2f}" if r['hrs_diff'] is not None else "—",
                 "Inv In":     fmt_dt(r['start']),
                 "Inv Out":    fmt_dt(r['end']),
                 "Emp In":     fmt_dt(r['e_in']),
