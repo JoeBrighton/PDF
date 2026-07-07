@@ -275,44 +275,79 @@ def find_emp(name, date, emp_idx):
 def reconcile(shifts, emp_idx):
     rows = []
     name_notes = []
+
+    # Pre-group invoice lines by (norm_emp, date) so split invoice shifts
+    # (same employee, same date, multiple ShiftKey lines) are compared as one total.
+    inv_groups = defaultdict(list)
     for s in shifts:
-        date, emp, inv_hrs, worked_brk, lc = s['date'], s['emp'], s['inv_hrs'], s['worked_brk'], s['lc']
-        if lc:
+        if s['lc']:
+            # Late cancels always stand alone
             rows.append({**s, 'e_in': None, 'e_out': None, 'e_raw': None, 'e_adj': None,
                           'start_diff': None, 'end_diff': None, 'hrs_diff': None,
                           'flag': 'LATE CANCEL', 'notes': '', 'match_type': 'lc', 'confidence': None})
-            continue
+        else:
+            inv_groups[(norm(s['emp']), s['date'])].append(s)
+
+    for key, group in inv_groups.items():
+        # Sort group by start time so first entry = earliest shift
+        group.sort(key=lambda x: x['start'] or datetime.min)
+        s = group[0]  # representative shift (earliest)
+        date, emp = s['date'], s['emp']
+        combined_inv_hrs = round(sum(g['inv_hrs'] for g in group), 2)
+        worked_brk = any(g['worked_brk'] for g in group)
+        split_inv  = len(group) > 1
+
         m, match_type, match_note, name_confidence = find_emp(emp, date, emp_idx)
         notes = []
+        if split_inv:
+            notes.append(f"Split invoice ({len(group)} lines combined: {combined_inv_hrs}h total)")
         if match_note:
             notes.append(match_note)
             name_notes.append(f"{date} {emp}: {match_note}")
         if worked_brk:
             notes.append("Worked break — full gross billed")
+
         if not m:
-            flag = 'MICRO SHIFT' if inv_hrs < 1.0 else 'NO PUNCH'
-            rows.append({**s, 'e_in': None, 'e_out': None, 'e_raw': None, 'e_adj': None,
-                          'start_diff': None, 'end_diff': None, 'hrs_diff': None,
-                          'flag': flag, 'notes': '; '.join(notes), 'match_type': 'no-match', 'confidence': 0.0})
+            flag = 'MICRO SHIFT' if combined_inv_hrs < 1.0 else 'NO PUNCH'
+            # Emit one row per invoice line so punch-for-punch detail is preserved
+            for g in group:
+                rows.append({**g, 'inv_hrs': combined_inv_hrs if g is s else 0,
+                              'e_in': None, 'e_out': None, 'e_raw': None, 'e_adj': None,
+                              'start_diff': None, 'end_diff': None, 'hrs_diff': None,
+                              'flag': flag, 'notes': '; '.join(notes) if g is s else 'see above',
+                              'match_type': 'no-match', 'confidence': 0.0})
             continue
+
         if m['split']:
-            notes.append(f"Split punch ({len(m['entries'])} entries combined)")
+            notes.append(f"Split Empion punch ({len(m['entries'])} entries combined)")
         if m['raw'] < 1.0:
             notes.append(f"Micro-punch ({m['raw']}h — likely bad punch)")
-        start_diff = round((m['in']  - s['start']).total_seconds() / 60, 1) if s['start'] else None
-        end_diff   = round((m['out'] - s['end']  ).total_seconds() / 60, 1) if s['end']   else None
-        hrs_diff   = round(inv_hrs - m['adj'], 2)
+
+        # Compare COMBINED invoice hours vs Empion adjusted hours
+        hrs_diff = round(combined_inv_hrs - m['adj'], 2)
         if abs(hrs_diff) < 0.05:    flag = 'MATCH'
         elif hrs_diff > 0:          flag = f'OVERBILLED +{hrs_diff:.2f}h'
         else:                       flag = f'UNDERBILLED {hrs_diff:.2f}h'
-        if worked_brk:  flag = 'WORKED BREAK'
-        if m['raw'] < 1.0: flag = 'BAD PUNCH'
+        if worked_brk:              flag = 'WORKED BREAK'
+        if m['raw'] < 1.0:         flag = 'BAD PUNCH'
         if match_type == 'fuzzy-review': flag = f'REVIEW NAME MATCH | {flag}'
         confidence = round(name_confidence, 2)
-        rows.append({**s, 'e_in': m['in'], 'e_out': m['out'], 'e_raw': m['raw'],
-                     'e_adj': m['adj'], 'start_diff': start_diff, 'end_diff': end_diff,
+
+        # Earliest inv start / latest inv end across all lines in group
+        inv_start = min((g['start'] for g in group if g['start']), default=None)
+        inv_end   = max((g['end']   for g in group if g['end']),   default=None)
+        start_diff = round((m['in']  - inv_start).total_seconds() / 60, 1) if inv_start else None
+        end_diff   = round((m['out'] - inv_end  ).total_seconds() / 60, 1) if inv_end   else None
+
+        # Emit one summary row (combined inv_hrs) for the group
+        rows.append({**s, 'inv_hrs': combined_inv_hrs, 'start': inv_start, 'end': inv_end,
+                     'e_in': m['in'], 'e_out': m['out'], 'e_raw': m['raw'], 'e_adj': m['adj'],
+                     'start_diff': start_diff, 'end_diff': end_diff,
                      'hrs_diff': hrs_diff, 'flag': flag, 'notes': '; '.join(notes),
                      'match_type': match_type, 'confidence': confidence})
+
+    # Sort output by date then employee name for readability
+    rows.sort(key=lambda r: (r['date'], r['emp']))
     return rows, name_notes
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -613,8 +648,7 @@ if pdf_file and xlsx_file:
                 "Confidence": conf_label(r.get('confidence')),
                 "Inv Hrs":    f"{r['inv_hrs']:.2f}",
                 "Emp Hrs":    f"{r['e_adj']:.2f}" if r['e_adj'] is not None else "—",
-                "Δ Hrs":      f"{r['hrs_diff']:+.2f}" if r['hrs_diff'] is not None else "—",
-                "Inv In":     fmt_dt(r['start']),
+                "Δ Hrs":      f"{r['hrs_diff']:+.2f}" if r['hrs_diff'] is not None else "—",                "Inv In":     fmt_dt(r['start']),
                 "Inv Out":    fmt_dt(r['end']),
                 "Emp In":     fmt_dt(r['e_in']),
                 "Emp Out":    fmt_dt(r['e_out']),
@@ -622,9 +656,9 @@ if pdf_file and xlsx_file:
             } for r in flag_rows]
             st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
         else:
-            st.success("🎉 All shifts matched — no issues found!")
+            st.success("All shifts matched — no issues found!")
 
-        # ── Downloads ─────────────────────────────────────────────────────
+        # Downloads
         st.divider()
         st.subheader("Download Reports")
         inv_slug = meta['invoice'].replace('-', '_')
@@ -634,7 +668,7 @@ if pdf_file and xlsx_file:
         with d1:
             hours_bytes = build_hours_excel(meta, shifts)
             st.download_button(
-                "⬇️  Hours by Employee (Excel)",
+                "Hours by Employee (Excel)",
                 data=hours_bytes,
                 file_name=f"{fac_slug}_{inv_slug}_Hours.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -643,7 +677,7 @@ if pdf_file and xlsx_file:
         with d2:
             flags_bytes = build_flags_excel(meta, recon_rows)
             st.download_button(
-                "⬇️  Flags & Punch-for-Punch (Excel)",
+                "Flags & Punch-for-Punch (Excel)",
                 data=flags_bytes,
                 file_name=f"{fac_slug}_{inv_slug}_Flags.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
