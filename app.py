@@ -740,7 +740,7 @@ def ocr_intact_screenshot(img_bytes):
             })
         return img, result
 
-    except ImportError:
+    except Exception:
         return None, []
 
 
@@ -786,7 +786,7 @@ with tab2:
                 img, intact_rows = ocr_intact_screenshot(intact_file.read())
 
             if img is None:
-                st.error("pytesseract not available on this server. Install tesseract to enable screenshot OCR.")
+                st.error("Tesseract OCR not available. Make sure packages.txt (containing 'tesseract-ocr') is in your GitHub repo and the app has redeployed.")
             else:
                 with st.spinner("Matching..."):
                     matches = match_intact_to_bank(intact_rows, bank_txns)
@@ -947,4 +947,4 @@ with tab1:
                 )
     else:
         st.info("Upload both files above to get started.")
-
+ad both files above to get started.")
