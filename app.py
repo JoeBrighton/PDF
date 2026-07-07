@@ -536,11 +536,6 @@ def build_flags_excel(meta, recon_rows):
         c.font = S['HFONT']; c.fill = S['HDR_F']; c.alignment = S['CTR']
     ws1.row_dimensions[6].height = 16
 
-    for ci, h in enumerate(["Date","Employee","Role","Issue","Invoice In","Invoice Out","Empion In","Empion Out","Notes"], 1):
-        c = ws1.cell(row=2, column=ci, value=h)
-        c.font = S['HFONT']; c.fill = S['HDR_F']; c.alignment = S['CTR']
-    ws1.row_dimensions[2].height = 16
-
     ri = 7
     for r in recon_rows:
         if r['flag'] in ('MATCH', 'LATE CANCEL'): continue
