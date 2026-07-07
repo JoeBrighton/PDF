@@ -1,0 +1,42 @@
+CLIPBOARD INVOICE RECONCILIATION APP
+=====================================
+
+FIRST TIME SETUP (do once)
+---------------------------
+1. Install Python from https://python.org  (version 3.9 or newer)
+2. Open a terminal / command prompt
+3. Navigate to this folder:
+      cd "C:\Users\JGreenberg\OneDrive - Brighton Healthcare\Documents\cluade\CON SOP\clipboard_recon"
+4. Install dependencies:
+      pip install -r requirements.txt
+
+
+TO RUN THE APP
+--------------
+1. Open a terminal / command prompt
+2. Navigate to this folder:
+      cd "C:\Users\JGreenberg\OneDrive - Brighton Healthcare\Documents\cluade\CON SOP\clipboard_recon"
+3. Run:
+      streamlit run app.py
+4. A browser window will open automatically at http://localhost:8501
+
+
+USING THE APP
+-------------
+1. Upload the Clipboard invoice PDF (left uploader)
+2. Upload the Empion punch report Excel (right uploader)
+3. Click "Run Reconciliation"
+4. Review the flags table on screen
+5. Download the two Excel reports:
+   - Hours by Employee  — hours grid by day
+   - Flags & Punch-for-Punch — flagged issues + full punch comparison
+
+
+NOTES
+-----
+- Works with any Clipboard invoice (CNA, RN, LPN, LVN, CMA roles)
+- Automatically detects column order in Empion export
+- Handles late cancels, worked break payments, split punches, micro-punches
+- Fuzzy name matching catches minor spelling differences and middle names
+- If an employee name is completely different between Clipboard and Empion
+  (e.g., a name change), it will show as NO PUNCH — check Empion manually
