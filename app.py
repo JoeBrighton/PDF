@@ -315,7 +315,7 @@ def reconcile(shifts, emp_idx):
                               'e_in': None, 'e_out': None, 'e_raw': None, 'e_adj': None,
                               'start_diff': None, 'end_diff': None, 'hrs_diff': None,
                               'flag': flag, 'notes': '; '.join(notes) if g is s else 'see above',
-                              'match_type': 'no-match', 'confidence': 0.0})
+                              'match_type': 'no-match', 'confidence': 1.0})
             continue
 
         if m['split']:
@@ -478,21 +478,70 @@ def build_flags_excel(meta, recon_rows):
         if flag == 'LATE CANCEL': return S['GRY_F']
         return S['GRN_F']
 
+    # Pre-compute summary stats
+    total_items    = len(recon_rows)
+    n_match  = sum(1 for r in recon_rows if r['flag'] == 'MATCH')
+    n_lc     = sum(1 for r in recon_rows if r['flag'] == 'LATE CANCEL')
+    n_np     = sum(1 for r in recon_rows if 'NO PUNCH' in r['flag'])
+    n_over   = sum(1 for r in recon_rows if 'OVERBILLED' in r['flag'])
+    n_under  = sum(1 for r in recon_rows if 'UNDERBILLED' in r['flag'])
+    n_other  = total_items - n_match - n_lc - n_np - n_over - n_under
+    total_inv_hrs  = round(sum(r['inv_hrs'] for r in recon_rows if not r['lc']), 2)
+    total_emp_hrs  = round(sum(r['e_adj'] for r in recon_rows if r['e_adj'] is not None), 2)
+    punch_disc_hrs = round(sum(r['hrs_diff'] for r in recon_rows if r.get('hrs_diff') is not None), 2)
+    missing_hrs    = round(sum(r['inv_hrs'] for r in recon_rows if r['match_type'] == 'no-match'), 2)
+
     wb = Workbook()
 
     # ── Sheet 1: Flags ────────────────────────────────────────────────────
     ws1 = wb.active; ws1.title = "Flags"
+
+    # Title
     ws1.merge_cells("A1:I1")
-    ws1["A1"] = f"Invoice {meta['invoice']} — {meta['facility']} — Issues to Verify in Empion"
+    ws1["A1"] = f"Invoice {meta['invoice']} — {meta['facility']} — {meta.get('vendor','Clipboard')}"
     ws1["A1"].font = Font(name="Arial", bold=True, size=12, color="1F4E79")
     ws1.row_dimensions[1].height = 22
+
+    # Period / balance
+    ws1.merge_cells("A2:I2")
+    ws1["A2"] = f"Period: {meta['period_start']} – {meta['period_end']}   |   Balance Due: ${meta['balance_due']:,.2f}"
+    ws1["A2"].font = Font(name="Arial", size=9, color="595959")
+    ws1.row_dimensions[2].height = 14
+
+    # Summary stats header row
+    SUMHDR_F = PatternFill("solid", start_color="2E75B6")
+    SUMVAL_F = PatternFill("solid", start_color="D6E4F0")
+    stat_labels = ["Match", "No Punch", "Overbilled", "Underbilled", "Other", "Late Cancel",
+                   "Inv Hours", "Emp Hours", "Punch Disc.", "Missing Hrs"]
+    stat_values = [n_match, n_np, n_over, n_under, n_other, n_lc,
+                   f"{total_inv_hrs:.2f}h", f"{total_emp_hrs:.2f}h",
+                   f"{punch_disc_hrs:+.2f}h", f"{missing_hrs:.2f}h"]
+    for ci, lbl in enumerate(stat_labels, 1):
+        c = ws1.cell(row=3, column=ci, value=lbl)
+        c.font = Font(name="Arial", bold=True, size=8, color="FFFFFF")
+        c.fill = SUMHDR_F; c.alignment = Alignment(horizontal="center", vertical="center")
+    for ci, val in enumerate(stat_values, 1):
+        c = ws1.cell(row=4, column=ci, value=val)
+        c.font = Font(name="Arial", bold=True, size=9)
+        c.fill = SUMVAL_F; c.alignment = Alignment(horizontal="center", vertical="center")
+    ws1.row_dimensions[3].height = 14
+    ws1.row_dimensions[4].height = 16
+
+    # Blank spacer
+    ws1.row_dimensions[5].height = 6
+
+    # Column headers (shifted down by 4 rows)
+    for ci, h in enumerate(["Date","Employee","Role","Issue","Invoice In","Invoice Out","Empion In","Empion Out","Notes"], 1):
+        c = ws1.cell(row=6, column=ci, value=h)
+        c.font = S['HFONT']; c.fill = S['HDR_F']; c.alignment = S['CTR']
+    ws1.row_dimensions[6].height = 16
 
     for ci, h in enumerate(["Date","Employee","Role","Issue","Invoice In","Invoice Out","Empion In","Empion Out","Notes"], 1):
         c = ws1.cell(row=2, column=ci, value=h)
         c.font = S['HFONT']; c.fill = S['HDR_F']; c.alignment = S['CTR']
     ws1.row_dimensions[2].height = 16
 
-    ri = 3
+    ri = 7
     for r in recon_rows:
         if r['flag'] in ('MATCH', 'LATE CANCEL'): continue
         fill = row_fill(r['flag'])
@@ -518,7 +567,7 @@ def build_flags_excel(meta, recon_rows):
     ws1.column_dimensions["C"].width = 5;  ws1.column_dimensions["D"].width = 24
     for col in ["E","F","G","H"]: ws1.column_dimensions[col].width = 18
     ws1.column_dimensions["I"].width = 48
-    ws1.freeze_panes = "A3"
+    ws1.freeze_panes = "A7"
 
     # ── Sheet 2: Punch-for-Punch ──────────────────────────────────────────
     ws2 = wb.create_sheet("Punch-for-Punch")
