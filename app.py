@@ -657,42 +657,68 @@ def parse_intact_excel(xlsx_bytes):
 def parse_bank_statement(pdf_bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         text = "\n".join(p.extract_text() or "" for p in pdf.pages)
-    transactions = {}  # keyed by check_no for fast lookup
+    transactions = {}
 
-    # ACH/electronic checks: "05/04 Ck# V225 Chrr Georgia-FLWhigham Opco L ACH.Live/V1cr 150.00"
-    CK_RE = re.compile(
-        r'(\d{2}/\d{2})\s+Ck#\s+V(\d+)\s+Chrr\s+(.+?)\s+(?:Whigham Opco L|ACH\.Live/\S+)\s+([\d,]+\.\d{2})'
-    )
-    for m in CK_RE.finditer(text):
-        transactions[m.group(2)] = {
-            'date': m.group(1), 'check_no': m.group(2),
-            'vendor_raw': m.group(3).strip(),
-            'amount': float(m.group(4).replace(',', '')),
-            'type': 'ACH',
-        }
+    LINE_RE  = re.compile(r'^(\d{2}/\d{2})\s+(.+?)\s+([\d,]+\.\d{2})$')
+    CK_V_RE  = re.compile(r'Ck#\s+V(\d+)')
 
-    # Wire transfers: "05/01 Wire TransferWhig Troy, LLC 27,500.00"
-    WIRE_RE = re.compile(r'(\d{2}/\d{2})\s+Wire Transfer(.+?)\s+([\d,]+\.\d{2})$', re.MULTILINE)
+    # ── WITHDRAWALS section (captures every debit line generically) ──────────
+    in_wd = False
     wire_idx = 1
-    for m in WIRE_RE.finditer(text):
-        key = f"WIRE_{wire_idx}"; wire_idx += 1
-        transactions[key] = {
-            'date': m.group(1), 'check_no': None,
-            'vendor_raw': m.group(2).strip(),
-            'amount': float(m.group(3).replace(',', '')),
-            'type': 'Wire',
-        }
-
-    # Paper checks section
-    in_checks = False
-    CHK_SEC_RE = re.compile(r'(\d{2}/\d{2})\s+(\d{3,})\s+([\d,]+\.\d{2})')
     for line in text.split('\n'):
-        if line.strip().startswith('CHECKS') and 'CONTINUED' not in line: in_checks = True
-        if 'Total Checks' in line: in_checks = False
+        s = line.strip()
+        if re.match(r'^WITHDRAWALS', s) and 'Total' not in s:
+            in_wd = True; continue
+        if 'Total Withdrawals' in s or re.match(r'^FEES', s):
+            in_wd = False
+        if not in_wd:
+            continue
+        m = LINE_RE.match(s)
+        if not m:
+            continue
+        date, desc, amt_str = m.group(1), m.group(2), m.group(3)
+        amount = float(amt_str.replace(',', ''))
+
+        ck_m = CK_V_RE.search(desc)
+        if ck_m:
+            # Intact ACH check (Ck# V###)
+            ck_no = ck_m.group(1)
+            # extract vendor between "Ck# Vxxx Chrr" and "Whigham"
+            vend_m = re.search(r'Ck#\s+V\d+\s+Chrr\s+(.+?)\s+(?:Whigham|ACH\.Live)', desc)
+            vendor_raw = vend_m.group(1).strip() if vend_m else desc
+            transactions[ck_no] = {
+                'date': date, 'check_no': ck_no,
+                'vendor_raw': vendor_raw, 'amount': amount, 'type': 'ACH Check',
+            }
+        elif 'Wire Transfer' in desc:
+            key = f"WIRE_{wire_idx}"; wire_idx += 1
+            vendor_raw = desc.replace('Wire Transfer', '').strip()
+            transactions[key] = {
+                'date': date, 'check_no': None,
+                'vendor_raw': vendor_raw, 'amount': amount, 'type': 'Wire',
+            }
+        else:
+            # General ACH / debit / merchant charge
+            key = f"ACH_{date}_{len(transactions)}"
+            transactions[key] = {
+                'date': date, 'check_no': None,
+                'vendor_raw': desc, 'amount': amount, 'type': 'ACH/Debit',
+            }
+
+    # ── CHECKS section (paper checks — date + check# + amount columns) ──────
+    in_checks = False
+    CHK_SEC_RE = re.compile(r'(\d{2}/\d{2})\s+(\d{3,})\s+\*?\s*([\d,]+\.\d{2})')
+    for line in text.split('\n'):
+        s = line.strip()
+        if re.match(r'^CHECKS', s) and 'CONTINUED' not in s and 'Total' not in s:
+            in_checks = True; continue
+        if 'Total Checks' in s:
+            in_checks = False
         if in_checks:
-            for m in CHK_SEC_RE.finditer(line):
-                transactions[m.group(2)] = {
-                    'date': m.group(1), 'check_no': m.group(2),
+            for m in CHK_SEC_RE.finditer(s):
+                ck_no = m.group(2)
+                transactions[ck_no] = {
+                    'date': m.group(1), 'check_no': ck_no,
                     'vendor_raw': '', 'amount': float(m.group(3).replace(',', '')),
                     'type': 'Check',
                 }
