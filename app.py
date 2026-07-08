@@ -621,36 +621,67 @@ def build_flags_excel(meta, recon_rows):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_intact_excel(xlsx_bytes):
-    """Parse Intact uncleared checks Excel export."""
+    """Parse Intact GL register export — all transaction types."""
     from openpyxl import load_workbook
     wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
     ws = wb.active
-    # Find header row (contains 'Check No' and 'Amount')
+
+    # Find header row (must contain 'Amount'; 'Check No' optional)
     hdr_row = None
     for i, row in enumerate(ws.iter_rows(values_only=True), 1):
-        vals = [str(v).strip() if v else '' for v in row]
-        if 'Check No' in vals and 'Amount' in vals:
+        vals = [str(v).strip() if v is not None else '' for v in row]
+        if 'Amount' in vals:
             hdr_row = i
             headers = vals
             break
     if not hdr_row:
-        raise ValueError("Could not find header row with 'Check No' and 'Amount'")
+        raise ValueError("Could not find header row with 'Amount'")
 
-    ck_col  = headers.index('Check No')
-    amt_col = headers.index('Amount')
-    vnd_col = headers.index('Vendor') if 'Vendor' in headers else None
-    dt_col  = next((i for i, h in enumerate(headers) if 'GL date' in h or 'GL Date' in h), None)
+    def col(name):
+        return next((i for i, h in enumerate(headers) if name.lower() in h.lower()), None)
+
+    ck_col   = col('Check No')
+    amt_col  = headers.index('Amount')
+    vnd_col  = col('Vendor')
+    dt_col   = col('GL date') if col('GL date') is not None else col('GL Date')
+    type_col = col('Checks and debits') if col('Checks and debits') is not None else col('transaction type')
+    sub_col  = col('AP payment') if col('AP payment') is not None else col('subtype')
 
     rows = []
     for row in ws.iter_rows(min_row=hdr_row+1, values_only=True):
-        ck  = row[ck_col]
-        amt = row[amt_col]
-        if ck is None or amt is None: continue
+        amt = row[amt_col] if amt_col is not None else None
+        if amt is None:
+            continue
+        try:
+            amt = float(amt)
+        except (ValueError, TypeError):
+            continue
+        if amt == 0:
+            continue
+
+        ck = row[ck_col] if ck_col is not None else None
+        if ck is not None:
+            try:
+                ck = str(int(float(ck)))
+            except (ValueError, TypeError):
+                ck = str(ck).strip() or None
+
+        vendor = str(row[vnd_col]).strip() if vnd_col is not None and row[vnd_col] else ''
+        gl_date = ''
+        if dt_col is not None and row[dt_col]:
+            v = row[dt_col]
+            gl_date = v.strftime('%m/%d/%Y') if hasattr(v, 'strftime') else str(v)
+
+        txn_type = str(row[type_col]).strip() if type_col is not None and row[type_col] else ''
+        txn_sub  = str(row[sub_col]).strip()  if sub_col  is not None and row[sub_col]  else ''
+
         rows.append({
-            'check_no': str(int(ck)) if isinstance(ck, float) else str(ck),
-            'amount':   float(amt),
-            'vendor':   str(row[vnd_col]) if vnd_col is not None and row[vnd_col] else '',
-            'gl_date':  row[dt_col].strftime('%m/%d/%Y') if dt_col is not None and hasattr(row[dt_col], 'strftime') else str(row[dt_col] or ''),
+            'check_no': ck,
+            'amount':   amt,
+            'vendor':   vendor,
+            'gl_date':  gl_date,
+            'txn_type': txn_type,
+            'txn_sub':  txn_sub,
         })
     return rows
 
@@ -726,25 +757,65 @@ def parse_bank_statement(pdf_bytes):
 
 def match_intact_to_bank(intact_rows, bank_txns):
     """
-    intact_rows: list of dicts with keys: check_no, amount, payee, row_index
-    Returns list of matched intact row_indexes.
+    Match Intact rows to bank transactions — NO date used (accrual accounting).
+    Priority:
+      1. Check number exact match (Intact check_no == bank check_no)
+      2. Amount exact match (within $0.02) + vendor fuzzy match
+      3. Amount exact match alone (last resort)
+    Each bank transaction can only be matched once.
     """
+    used_bank = set()  # id() of already-matched bank txns
     matched = []
+
+    # Pass 1: check number
     for row in intact_rows:
         ck = str(row.get('check_no', '')).strip()
         amt = row.get('amount')
-        # Primary: check number match
         if ck and ck in bank_txns:
             b = bank_txns[ck]
-            if amt is None or abs(b['amount'] - amt) < 0.02:
+            if id(b) not in used_bank and (amt is None or abs(b['amount'] - amt) < 0.02):
                 matched.append({'intact_row': row, 'bank': b, 'match_type': 'check_no'})
+                used_bank.add(id(b))
+
+    matched_intact = {id(m['intact_row']) for m in matched}
+
+    # Pass 2: amount + vendor fuzzy
+    for row in intact_rows:
+        if id(row) in matched_intact:
+            continue
+        amt = row.get('amount')
+        vendor = norm(row.get('vendor', ''))
+        if not amt:
+            continue
+        best_score, best_b = 0, None
+        for b in bank_txns.values():
+            if id(b) in used_bank:
                 continue
-        # Fallback: amount + fuzzy vendor across all bank transactions
-        if amt:
-            for b in bank_txns.values():
-                if abs(b['amount'] - amt) < 0.02:
-                    matched.append({'intact_row': row, 'bank': b, 'match_type': 'amount'})
-                    break
+            if abs(b['amount'] - amt) < 0.02:
+                score = difflib.SequenceMatcher(None, vendor, norm(b.get('vendor_raw', ''))).ratio()
+                if score > best_score:
+                    best_score, best_b = score, b
+        if best_b and best_score >= 0.4:
+            matched.append({'intact_row': row, 'bank': best_b, 'match_type': f'amount+vendor ({best_score:.0%})'})
+            used_bank.add(id(best_b))
+            matched_intact.add(id(row))
+
+    # Pass 3: amount only
+    for row in intact_rows:
+        if id(row) in matched_intact:
+            continue
+        amt = row.get('amount')
+        if not amt:
+            continue
+        for b in bank_txns.values():
+            if id(b) in used_bank:
+                continue
+            if abs(b['amount'] - amt) < 0.02:
+                matched.append({'intact_row': row, 'bank': b, 'match_type': 'amount only'})
+                used_bank.add(id(b))
+                matched_intact.add(id(row))
+                break
+
     return matched
 
 def ocr_intact_screenshot(img_bytes):
@@ -854,7 +925,7 @@ with tab2:
             with st.spinner("Matching..."):
                 matches = match_intact_to_bank(intact_rows, bank_txns)
 
-            matched_ck = {m['intact_row']['check_no'] for m in matches}
+            matched_by_intact_id = {id(m['intact_row']): m for m in matches}
 
             st.divider()
             mc1, mc2, mc3, mc4 = st.columns(4)
@@ -866,12 +937,14 @@ with tab2:
             import pandas as pd
             all_rows = []
             for r in intact_rows:
-                cleared = r['check_no'] in matched_ck
-                bank = next((m['bank'] for m in matches if m['intact_row']['check_no'] == r['check_no']), None)
+                m = matched_by_intact_id.get(id(r))
+                bank = m['bank'] if m else None
                 all_rows.append({
-                    'Status':      'CLEARED' if cleared else 'PENDING',
-                    'Check #':     r['check_no'],
+                    'Status':      'CLEARED' if m else 'PENDING',
+                    'Match Type':  m['match_type'] if m else '',
+                    'Check #':     r['check_no'] or '--',
                     'GL Date':     r['gl_date'],
+                    'Txn Type':    r.get('txn_sub') or r.get('txn_type') or '',
                     'Vendor':      r['vendor'],
                     'Amount':      r['amount'],
                     'Bank Date':   bank['date'] if bank else '',
@@ -905,8 +978,6 @@ with tab2:
 
             # Bank transactions not in Intact
             matched_bank_keys = {m['bank']['check_no'] or f"WIRE_{list(bank_txns.keys()).index(next(k for k,v in bank_txns.items() if v is m['bank']))}" for m in matches}
-            unmatched_bank = [v for k, v in bank_txns.items() if k not in matched_ck and not k.startswith('WIRE_') or (k.startswith('WIRE_') and k not in {next((k2 for k2,v2 in bank_txns.items() if v2 is m['bank']), None) for m in matches})]
-            # simpler approach
             matched_bank_txns = {id(m['bank']) for m in matches}
             unmatched_bank = [v for v in bank_txns.values() if id(v) not in matched_bank_txns]
             if unmatched_bank:
