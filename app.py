@@ -877,6 +877,25 @@ with tab2:
             else:
                 st.success("All items cleared!")
 
+            # Bank transactions not in Intact
+            matched_bank_keys = {m['bank']['check_no'] or f"WIRE_{list(bank_txns.keys()).index(next(k for k,v in bank_txns.items() if v is m['bank']))}" for m in matches}
+            unmatched_bank = [v for k, v in bank_txns.items() if k not in matched_ck and not k.startswith('WIRE_') or (k.startswith('WIRE_') and k not in {next((k2 for k2,v2 in bank_txns.items() if v2 is m['bank']), None) for m in matches})]
+            # simpler approach
+            matched_bank_txns = {id(m['bank']) for m in matches}
+            unmatched_bank = [v for v in bank_txns.values() if id(v) not in matched_bank_txns]
+            if unmatched_bank:
+                st.divider()
+                st.subheader(f"{len(unmatched_bank)} Bank Transaction(s) Not in Intact")
+                st.caption("These cleared the bank but have no matching Intact uncleared check — may already be posted or entered outside Intact.")
+                ub_df = pd.DataFrame([{
+                    'Bank Date':  t['date'],
+                    'Check #':    t['check_no'] or '--',
+                    'Vendor':     t['vendor_raw'] or '--',
+                    'Amount':     f"${t['amount']:,.2f}",
+                    'Type':       t['type'],
+                } for t in sorted(unmatched_bank, key=lambda x: x['amount'], reverse=True)])
+                st.dataframe(ub_df, use_container_width=True, hide_index=True)
+
             # Download Excel
             out = io.BytesIO()
             from openpyxl import Workbook as WB2
