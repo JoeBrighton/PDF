@@ -620,6 +620,40 @@ def build_flags_excel(meta, recon_rows):
 # AP PAYMENT RECONCILIATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+def parse_intact_excel(xlsx_bytes):
+    """Parse Intact uncleared checks Excel export."""
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+    ws = wb.active
+    # Find header row (contains 'Check No' and 'Amount')
+    hdr_row = None
+    for i, row in enumerate(ws.iter_rows(values_only=True), 1):
+        vals = [str(v).strip() if v else '' for v in row]
+        if 'Check No' in vals and 'Amount' in vals:
+            hdr_row = i
+            headers = vals
+            break
+    if not hdr_row:
+        raise ValueError("Could not find header row with 'Check No' and 'Amount'")
+
+    ck_col  = headers.index('Check No')
+    amt_col = headers.index('Amount')
+    vnd_col = headers.index('Vendor') if 'Vendor' in headers else None
+    dt_col  = next((i for i, h in enumerate(headers) if 'GL date' in h or 'GL Date' in h), None)
+
+    rows = []
+    for row in ws.iter_rows(min_row=hdr_row+1, values_only=True):
+        ck  = row[ck_col]
+        amt = row[amt_col]
+        if ck is None or amt is None: continue
+        rows.append({
+            'check_no': str(int(ck)) if isinstance(ck, float) else str(ck),
+            'amount':   float(amt),
+            'vendor':   str(row[vnd_col]) if vnd_col is not None and row[vnd_col] else '',
+            'gl_date':  row[dt_col].strftime('%m/%d/%Y') if dt_col is not None and hasattr(row[dt_col], 'strftime') else str(row[dt_col] or ''),
+        })
+    return rows
+
 def parse_bank_statement(pdf_bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         text = "\n".join(p.extract_text() or "" for p in pdf.pages)
@@ -776,70 +810,101 @@ tab1, tab2 = st.tabs(["Staffing Invoice Recon", "AP Payment Recon"])
 
 with tab2:
     st.subheader("AP Payment Reconciliation")
-    st.caption("Upload the Intact pending payments screenshot and your bank statement PDF to highlight cleared items.")
+    st.caption("Upload the Intact uncleared checks Excel and your bank statement PDF.")
     st.info("Files are processed in memory only and never stored.", icon=None)
 
     ap1, ap2 = st.columns(2)
     with ap1:
-        intact_file = st.file_uploader("Intact Screenshot (PNG or JPG)", type=["png", "jpg", "jpeg"], key="intact")
+        intact_file = st.file_uploader("Intact Uncleared Checks (Excel)", type=["xlsx", "xls"], key="intact")
     with ap2:
         bank_file = st.file_uploader("Bank Statement (PDF)", type="pdf", key="bank")
 
     if intact_file and bank_file:
         if st.button("Run AP Reconciliation", type="primary", use_container_width=True):
+            with st.spinner("Parsing Intact export..."):
+                intact_rows = parse_intact_excel(intact_file.read())
             with st.spinner("Parsing bank statement..."):
                 bank_txns = parse_bank_statement(bank_file.read())
+            with st.spinner("Matching..."):
+                matches = match_intact_to_bank(intact_rows, bank_txns)
 
-            with st.spinner("Reading screenshot..."):
-                img, intact_rows = ocr_intact_screenshot(intact_file.read())
+            matched_ck = {m['intact_row']['check_no'] for m in matches}
 
-            if img is None:
-                err = intact_rows[0].get('_error', 'unknown') if intact_rows else 'unknown'
-                st.error(f"OCR failed: {err}")
+            st.divider()
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Intact items",        len(intact_rows))
+            mc2.metric("Bank transactions",   len(bank_txns))
+            mc3.metric("Cleared",             len(matches))
+            mc4.metric("Still pending",       len(intact_rows) - len(matches))
+
+            import pandas as pd
+            all_rows = []
+            for r in intact_rows:
+                cleared = r['check_no'] in matched_ck
+                bank = next((m['bank'] for m in matches if m['intact_row']['check_no'] == r['check_no']), None)
+                all_rows.append({
+                    'Status':      'CLEARED' if cleared else 'PENDING',
+                    'Check #':     r['check_no'],
+                    'GL Date':     r['gl_date'],
+                    'Vendor':      r['vendor'],
+                    'Amount':      r['amount'],
+                    'Bank Date':   bank['date'] if bank else '',
+                    'Bank Type':   bank['type'] if bank else '',
+                })
+
+            df = pd.DataFrame(all_rows)
+            st.dataframe(df.style.apply(
+                lambda row: ['background-color: #d4edda' if row['Status'] == 'CLEARED'
+                             else 'background-color: #f8d7da' for _ in row], axis=1
+            ), use_container_width=True, hide_index=True)
+
+            # Pending vendors summary
+            pending = [r for r in all_rows if r['Status'] == 'PENDING']
+            if pending:
+                from collections import defaultdict
+                vendor_totals = defaultdict(float)
+                vendor_checks = defaultdict(int)
+                for r in pending:
+                    vendor_totals[r['Vendor']] += r['Amount']
+                    vendor_checks[r['Vendor']] += 1
+                vendor_summary = sorted(vendor_totals.items(), key=lambda x: x[1], reverse=True)
+                st.subheader(f"{len(pending)} Pending Items — {len(vendor_summary)} Vendor(s)")
+                pending_df = pd.DataFrame([
+                    {'Vendor': v, 'Checks': vendor_checks[v], 'Outstanding ($)': f"${amt:,.2f}"}
+                    for v, amt in vendor_summary
+                ])
+                st.dataframe(pending_df, use_container_width=True, hide_index=True)
             else:
-                with st.spinner("Matching..."):
-                    matches = match_intact_to_bank(intact_rows, bank_txns)
+                st.success("All items cleared!")
 
-                matched_indices = {m['intact_row']['row_index'] for m in matches}
-                matched_tops = [
-                    (r['top'], r['bottom'])
-                    for r in intact_rows if r['row_index'] in matched_indices
-                ]
-
-                st.divider()
-                mc1, mc2, mc3 = st.columns(3)
-                mc1.metric("Bank transactions found", len(bank_txns))
-                mc2.metric("Intact rows scanned", len(intact_rows))
-                mc3.metric("Matched / cleared", len(matches))
-
-                import pandas as pd
-                with st.expander("OCR debug — what was extracted from screenshot"):
-                    debug_rows = [{'Row': r['row_index'], 'Check#': r['check_no'], 'Amount': r['amount'], 'Line': r['line'][:80]}
-                                  for r in intact_rows if r.get('check_no') or r.get('amount')]
-                    st.dataframe(pd.DataFrame(debug_rows), hide_index=True)
-
-                if matches:
-                    with st.expander("Matched items"):
-                        rows_display = [{
-                            "Check #":     m['intact_row']['check_no'] or "—",
-                            "Amount":      f"${m['bank']['amount']:,.2f}",
-                            "Bank Date":   m['bank']['date'],
-                            "Bank Vendor": m['bank']['vendor_raw'][:30],
-                            "Match Type":  m['match_type'],
-                        } for m in matches]
-                        st.dataframe(pd.DataFrame(rows_display), hide_index=True)
-
-                with st.spinner("Annotating screenshot..."):
-                    annotated = annotate_screenshot(img, matched_tops, img.width)
-
-                st.image(annotated, caption="Green = cleared in bank statement", use_container_width=True)
-                st.download_button(
-                    "Download Annotated Screenshot",
-                    data=annotated,
-                    file_name="intact_reconciled.png",
-                    mime="image/png",
-                    use_container_width=True,
-                )
+            # Download Excel
+            out = io.BytesIO()
+            from openpyxl import Workbook as WB2
+            wb2 = WB2(); ws2 = wb2.active; ws2.title = "AP Reconciliation"
+            GREEN = PatternFill("solid", start_color="C6EFCE")
+            RED_F = PatternFill("solid", start_color="FFC7CE")
+            hdrs = list(all_rows[0].keys())
+            for ci, h in enumerate(hdrs, 1):
+                c = ws2.cell(row=1, column=ci, value=h)
+                c.font = Font(bold=True, name="Arial", size=9, color="FFFFFF")
+                c.fill = PatternFill("solid", start_color="1F4E79")
+            for ri, row in enumerate(all_rows, 2):
+                fill = GREEN if row['Status'] == 'CLEARED' else RED_F
+                for ci, key in enumerate(hdrs, 1):
+                    c = ws2.cell(row=ri, column=ci, value=row[key])
+                    c.fill = fill
+                    c.font = Font(name="Arial", size=9)
+            for ci in [1,2,3]: ws2.column_dimensions[get_column_letter(ci)].width = 12
+            ws2.column_dimensions["D"].width = 32
+            for ci in [5,6,7]: ws2.column_dimensions[get_column_letter(ci)].width = 14
+            wb2.save(out); out.seek(0)
+            st.download_button(
+                "Download Reconciliation (Excel)",
+                data=out.read(),
+                file_name="AP_Reconciliation.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
     else:
         st.info("Upload both files above to get started.")
 
@@ -937,8 +1002,8 @@ with tab1:
 
             st.divider()
             st.subheader("Download Reports")
-            inv_slug = meta['invoice'].replace('-', '_')
-            fac_slug = re.sub(r'[^a-zA-Z0-9]', '_', meta['facility'])[:20].strip('_')
+            inv_slug = meta["invoice"].replace("-", "_")
+            fac_slug = re.sub(r"[^a-zA-Z0-9]", "_", meta["facility"])[:20].strip("_")
 
             d1, d2 = st.columns(2)
             with d1:
