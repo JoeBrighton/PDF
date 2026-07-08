@@ -730,10 +730,14 @@ def parse_bank_statement(pdf_bytes):
             }
         else:
             # General ACH / debit / merchant charge
+            # Extract numeric reference ID from description (e.g. "14003100000392")
+            ref_m = re.search(r'\b(\d{8,})\b', desc)
+            ref_id = ref_m.group(1) if ref_m else None
             key = f"ACH_{date}_{len(transactions)}"
             transactions[key] = {
                 'date': date, 'check_no': None,
                 'vendor_raw': desc, 'amount': amount, 'type': 'ACH/Debit',
+                'ref_id': ref_id,
             }
 
     # ── CHECKS section (paper checks — date + check# + amount columns) ──────
@@ -813,6 +817,39 @@ def match_intact_to_bank(intact_rows, bank_txns):
             if abs(b['amount'] - amt) < 0.02:
                 matched.append({'intact_row': row, 'bank': b, 'match_type': 'amount only'})
                 used_bank.add(id(b))
+                matched_intact.add(id(row))
+                break
+
+    # Pass 4: split bank transactions — same reference ID, sum matches Intact amount
+    # Group unmatched bank txns by ref_id
+    from collections import defaultdict
+    ref_groups = defaultdict(list)
+    for b in bank_txns.values():
+        if id(b) not in used_bank and b.get('ref_id'):
+            ref_groups[b['ref_id']].append(b)
+    # Only keep groups with 2+ transactions
+    ref_groups = {k: v for k, v in ref_groups.items() if len(v) >= 2}
+
+    for row in intact_rows:
+        if id(row) in matched_intact:
+            continue
+        amt = row.get('amount')
+        if not amt:
+            continue
+        for ref_id, group in ref_groups.items():
+            group_sum = sum(b['amount'] for b in group)
+            if abs(group_sum - amt) < 0.02:
+                # Match — use the largest transaction as the primary bank entry
+                primary = max(group, key=lambda b: b['amount'])
+                split_desc = ' + '.join(b['vendor_raw'][:20] for b in sorted(group, key=lambda b: b['amount'], reverse=True))
+                matched.append({
+                    'intact_row': row,
+                    'bank': primary,
+                    'match_type': f'split ({len(group)} bank txns, ref {ref_id})',
+                    'split_group': group,
+                })
+                for b in group:
+                    used_bank.add(id(b))
                 matched_intact.add(id(row))
                 break
 
@@ -1134,6 +1171,12 @@ with tab1:
                     "Issue":      r['flag'],
                     "Confidence": conf_label(r.get('confidence')),
                     "Inv Hrs":     f"{r['inv_hrs']:.2f}",
+                    "Emp Hrs":    f"{r['e_adj']:.2f}" if r['e_adj'] is not None else "--",
+                    "Hrs Diff":   f"{r['hrs_diff']:+.2f}" if r['hrs_diff'] is not None else "--",
+                    "Role":       r['role'],
+                    "Issue":      r['flag'],
+                    "Confidence": conf_label(r.get('confidence')),
+                    "Inv Hrs":    f"{r['inv_hrs']:.2f}",
                     "Emp Hrs":    f"{r['e_adj']:.2f}" if r['e_adj'] is not None else "--",
                     "Hrs Diff":   f"{r['hrs_diff']:+.2f}" if r['hrs_diff'] is not None else "--",
                     "Inv In":     fmt_dt(r['start']),
