@@ -942,6 +942,36 @@ with tab2:
             for ci in [1,2,3]: ws2.column_dimensions[get_column_letter(ci)].width = 12
             ws2.column_dimensions["D"].width = 32
             for ci in [5,6,7]: ws2.column_dimensions[get_column_letter(ci)].width = 14
+            # Sheet 2: Not in Intact checklist
+            ws3 = wb2.create_sheet("Not in Intact")
+            ni_hdrs = ['', 'Bank Date', 'Type', 'Check #', 'Vendor', 'Amount', 'Notes']
+            for ci, h in enumerate(ni_hdrs, 1):
+                c = ws3.cell(row=1, column=ci, value=h)
+                c.font = Font(bold=True, name="Arial", size=9, color="FFFFFF")
+                c.fill = PatternFill("solid", start_color="1F4E79")
+            YELLOW = PatternFill("solid", start_color="FFEB9C")
+            unmatched_sorted = sorted(unmatched_bank, key=lambda x: x['amount'], reverse=True)
+            for ri, t in enumerate(unmatched_sorted, 2):
+                ws3.cell(row=ri, column=1, value='☐').font = Font(name="Arial", size=11)
+                ws3.cell(row=ri, column=2, value=t['date']).font = Font(name="Arial", size=9)
+                ws3.cell(row=ri, column=3, value=t['type']).font = Font(name="Arial", size=9)
+                ws3.cell(row=ri, column=4, value=t['check_no'] or '--').font = Font(name="Arial", size=9)
+                ws3.cell(row=ri, column=5, value=t['vendor_raw'] or '--').font = Font(name="Arial", size=9)
+                amt_cell = ws3.cell(row=ri, column=6, value=t['amount'])
+                amt_cell.font = Font(name="Arial", size=9)
+                amt_cell.number_format = '"$"#,##0.00'
+                notes_cell = ws3.cell(row=ri, column=7, value='')
+                notes_cell.fill = YELLOW
+                notes_cell.font = Font(name="Arial", size=9)
+            ws3.column_dimensions["A"].width = 4
+            ws3.column_dimensions["B"].width = 10
+            ws3.column_dimensions["C"].width = 12
+            ws3.column_dimensions["D"].width = 10
+            ws3.column_dimensions["E"].width = 40
+            ws3.column_dimensions["F"].width = 14
+            ws3.column_dimensions["G"].width = 30
+            ws3.freeze_panes = "A2"
+
             wb2.save(out); out.seek(0)
             st.download_button(
                 "Download Reconciliation (Excel)",
@@ -1032,7 +1062,7 @@ with tab1:
                     "Role":       r['role'],
                     "Issue":      r['flag'],
                     "Confidence": conf_label(r.get('confidence')),
-                    "Inv Hrs":    f"{r['inv_hrs']:.2f}",
+                    "Inv Hrs":     f"{r['inv_hrs']:.2f}",
                     "Emp Hrs":    f"{r['e_adj']:.2f}" if r['e_adj'] is not None else "--",
                     "Hrs Diff":   f"{r['hrs_diff']:+.2f}" if r['hrs_diff'] is not None else "--",
                     "Inv In":     fmt_dt(r['start']),
