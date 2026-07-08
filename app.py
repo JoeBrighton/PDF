@@ -731,7 +731,7 @@ def parse_bank_statement(pdf_bytes):
         else:
             # General ACH / debit / merchant charge
             # Extract numeric reference ID from description (e.g. "14003100000392")
-            ref_m = re.search(r'\b(\d{8,})\b', desc)
+            ref_m = re.search(r'(?<!\d)(\d{8,})(?!\d)', desc)
             ref_id = ref_m.group(1) if ref_m else None
             key = f"ACH_{date}_{len(transactions)}"
             transactions[key] = {
