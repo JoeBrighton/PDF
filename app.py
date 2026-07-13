@@ -13,7 +13,7 @@ from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Brighton Healthcare Tools", layout="wide")
 st.title("Brighton Healthcare Tools")
-st.caption("Upload a Clipboard or ShiftKey invoice PDF and an Empion punch report to generate the reconciliation.")
+st.caption("Staffing invoice reconciliation and AP bank reconciliation tools.")
 st.info(
     "🔒 **Privacy:** Uploaded files are processed in memory only and never stored. "
     "All data is discarded when you close the browser or upload new files. "
@@ -336,8 +336,17 @@ def reconcile(shifts, emp_idx):
         # Earliest inv start / latest inv end across all lines in group
         inv_start = min((g['start'] for g in group if g['start']), default=None)
         inv_end   = max((g['end']   for g in group if g['end']),   default=None)
-        start_diff = round((m['in']  - inv_start).total_seconds() / 60, 1) if inv_start else None
-        end_diff   = round((m['out'] - inv_end  ).total_seconds() / 60, 1) if inv_end   else None
+        start_diff = round((m['in']  - inv_start).total_seconds() / 60, 1) if inv_start and m['in']  else None
+        end_diff   = round((m['out'] - inv_end  ).total_seconds() / 60, 1) if inv_end   and m['out'] else None
+
+        # Flag time discrepancy > 7 minutes on either punch
+        TIME_THRESH = 7
+        time_bad = (start_diff is not None and abs(start_diff) > TIME_THRESH) or \
+                   (end_diff   is not None and abs(end_diff)   > TIME_THRESH)
+        if time_bad and flag == 'MATCH':
+            flag = 'TIME DIFF'
+        elif time_bad and flag not in ('BAD PUNCH', 'WORKED BREAK'):
+            flag = flag + ' | TIME DIFF'
 
         # Emit one summary row (combined inv_hrs) for the group
         rows.append({**s, 'inv_hrs': combined_inv_hrs, 'start': inv_start, 'end': inv_end,
@@ -595,10 +604,10 @@ def build_flags_excel(meta, recon_rows):
         cv2(11, r['e_raw'], "0.00"); cv2(12, r['e_adj'], "0.00", fnt=S['BF'])
         sd = ws2.cell(row=ri2, column=13, value=r['start_diff'])
         sd.fill = fill; sd.alignment = S['CTR']; sd.number_format = "+0.0;-0.0;0"
-        sd.font = S['RF'] if (r['start_diff'] and abs(r['start_diff']) >= 10) else S['NF']
+        sd.font = S['RF'] if (r['start_diff'] and abs(r['start_diff']) > 7) else S['NF']
         ed = ws2.cell(row=ri2, column=14, value=r['end_diff'])
         ed.fill = fill; ed.alignment = S['CTR']; ed.number_format = "+0.0;-0.0;0"
-        ed.font = S['RF'] if (r['end_diff'] and abs(r['end_diff']) >= 10) else S['NF']
+        ed.font = S['RF'] if (r['end_diff'] and abs(r['end_diff']) > 7) else S['NF']
         hc = ws2.cell(row=ri2, column=15, value=r['hrs_diff'])
         hc.fill = fill; hc.alignment = S['CTR']; hc.number_format = "+0.00;-0.00;0.00"
         if r['hrs_diff'] and r.get('e_raw') and r['e_raw'] >= 1 and not r['worked_brk']:
@@ -1092,14 +1101,6 @@ with tab2:
         st.info("Upload both files above to get started.")
 
 with tab1:
-    st.caption("Upload a Clipboard or ShiftKey invoice PDF and an Empion punch report to generate the reconciliation.")
-    st.info(
-        "Privacy: Uploaded files are processed in memory only and never stored. "
-        "All data is discarded when you close the browser or upload new files. "
-        "Nothing is saved to any server or database.",
-        icon=None,
-    )
-
     col1, col2 = st.columns(2)
     with col1:
         pdf_file  = st.file_uploader("Invoice PDF (Clipboard or ShiftKey)", type="pdf")
@@ -1205,13 +1206,4 @@ with tab1:
                     use_container_width=True,
                 )
             with d2:
-                flags_bytes = build_flags_excel(meta, recon_rows)
-                st.download_button(
-                    "Flags & Punch-for-Punch (Excel)",
-                    data=flags_bytes,
-                    file_name=f"{fac_slug}_{inv_slug}_Flags.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-    else:
-        st.info("Upload both files above to get started.")
+                flags_bytes = build_fla
