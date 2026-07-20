@@ -695,6 +695,114 @@ def parse_intact_excel(xlsx_bytes):
     return rows
 
 def parse_bank_statement(pdf_bytes):
+    """Auto-detect bank and route to correct parser."""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        first_page = pdf.pages[0].extract_text() or ""
+    if 'cibc' in first_page.lower():
+        return parse_cibc_statement(pdf_bytes)
+    return parse_regions_statement(pdf_bytes)
+
+
+def parse_cibc_statement(pdf_bytes):
+    """Parse CIBC Bank USA multi-line debit statement format."""
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        text = "\n".join(p.extract_text() or "" for p in pdf.pages)
+
+    transactions = {}
+    DATE_AMT_RE = re.compile(r'^(\d{2}/\d{2})\s+(.+?)\s+([\d,]+\.\d{2})$')
+    CK_V_RE     = re.compile(r'CK#\s+V(\d+)')
+    REF_RE      = re.compile(r'(?<!\d)(\d{8,})(?!\d)')
+
+    # ── Debits section ────────────────────────────────────────────────────────
+    in_debits = False
+    lines = text.split('\n')
+    wire_idx = 1
+
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+
+        if re.match(r'^Debits', s) and 'continued' not in s.lower():
+            in_debits = True; i += 1; continue
+        if re.match(r'^Credits', s) or re.match(r'^Daily Balances', s) or re.match(r'^Checks Posted', s):
+            in_debits = False
+
+        if not in_debits:
+            i += 1; continue
+
+        m = DATE_AMT_RE.match(s)
+        if not m:
+            i += 1; continue
+
+        date    = m.group(1)
+        desc1   = m.group(2).strip()
+        amount  = float(m.group(3).replace(',', ''))
+
+        # Grab next 1-2 continuation lines for vendor/ref info
+        cont_lines = []
+        for j in range(i+1, min(i+3, len(lines))):
+            c = lines[j].strip()
+            if DATE_AMT_RE.match(c) or not c:
+                break
+            cont_lines.append(c)
+        full_desc = ' '.join([desc1] + cont_lines)
+
+        # Determine type and extract check number
+        ck_m = CK_V_RE.search(full_desc)
+        ref_m = REF_RE.search(full_desc)
+        ref_id = ref_m.group(1) if ref_m else None
+
+        if ck_m:
+            ck_no = ck_m.group(1)
+            vend_m = re.search(r'CK#\s+V\d+\s+CHRR(.+?)(?:\s+\d{6}|\s+ACH\.LIVE)', full_desc)
+            vendor_raw = vend_m.group(1).strip() if vend_m else desc1
+            transactions[ck_no] = {
+                'date': date, 'check_no': ck_no,
+                'vendor_raw': vendor_raw, 'amount': amount,
+                'type': 'ACH Check', 'ref_id': ref_id,
+            }
+        elif 'Term-outgoing Wt' in desc1 or 'Wt/Dom' in desc1:
+            key = f"WIRE_{wire_idx}"; wire_idx += 1
+            # Line 2 format: "{digits}{VENDOR NAME}" — strip leading digits to get vendor
+            raw_line2 = cont_lines[0].strip() if cont_lines else desc1
+            vend_raw = re.sub(r'^\d+', '', raw_line2).strip() or raw_line2
+            transactions[key] = {
+                'date': date, 'check_no': None,
+                'vendor_raw': vend_raw, 'amount': amount,
+                'type': 'Wire', 'ref_id': ref_id,
+            }
+        elif 'Cash Mgmt Trsfr' in desc1:
+            key = f"XFER_{date}_{len(transactions)}"
+            transactions[key] = {
+                'date': date, 'check_no': None,
+                'vendor_raw': full_desc, 'amount': amount,
+                'type': 'Transfer', 'ref_id': ref_id,
+            }
+        else:
+            key = f"ACH_{date}_{len(transactions)}"
+            transactions[key] = {
+                'date': date, 'check_no': None,
+                'vendor_raw': full_desc, 'amount': amount,
+                'type': 'ACH/Debit', 'ref_id': ref_id,
+            }
+        i += 1
+
+    # ── Paper checks (from "Check #XXXX, PostedMM/DD/YY, AmountX.XX" lines) ──
+    CHK_RE = re.compile(r'Check\s+#(\d+),\s+Posted(\d{2}/\d{2}/\d{2}),\s+Amount([\d,]+\.\d{2})')
+    for m in CHK_RE.finditer(text):
+        ck_no = str(int(m.group(1)))  # strip leading zeros
+        transactions[ck_no] = {
+            'date':       m.group(2)[:5],   # MM/DD only
+            'check_no':   ck_no,
+            'vendor_raw': '',
+            'amount':     float(m.group(3).replace(',', '')),
+            'type':       'Check', 'ref_id': None,
+        }
+
+    return transactions
+
+
+def parse_regions_statement(pdf_bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         text = "\n".join(p.extract_text() or "" for p in pdf.pages)
     transactions = {}
