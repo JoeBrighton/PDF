@@ -754,8 +754,8 @@ def parse_cibc_statement(pdf_bytes):
 
         if ck_m:
             ck_no = ck_m.group(1)
-            vend_m = re.search(r'CK#\s+V\d+\s+CHRR(.+?)(?:\s+\d{6}|\s+ACH\.LIVE)', full_desc)
-            vendor_raw = vend_m.group(1).strip() if vend_m else desc1
+            vend_m = re.search(r'CK#\s+V\d+\s+CHRR(.+?)(?:\d{6}|ACH\.LIVE)', full_desc)
+            vendor_raw = re.sub(r'\d{6}$', '', vend_m.group(1)).strip() if vend_m else desc1
             transactions[ck_no] = {
                 'date': date, 'check_no': ck_no,
                 'vendor_raw': vendor_raw, 'amount': amount,
@@ -888,6 +888,25 @@ def match_intact_to_bank(intact_rows, bank_txns):
     used_bank = set()  # id() of already-matched bank txns
     matched = []
 
+    def _criteria(row, b, vendor_score=None):
+        """Return all matching criteria that confirm this pair."""
+        parts = []
+        ck = str(row.get('check_no', '') or '').strip()
+        b_ck = str(b.get('check_no', '') or b.get('ref_id', '') or '').strip()
+        amt = row.get('amount')
+        vendor = norm(row.get('vendor', '') or '')
+        b_vendor = norm(b.get('vendor_raw', '') or '')
+        if ck and b_ck and ck == b_ck:
+            parts.append('Check#')
+        if amt is not None and abs(b['amount'] - amt) < 0.02:
+            parts.append('Amount')
+        if vendor and b_vendor:
+            score = vendor_score if vendor_score is not None else \
+                    difflib.SequenceMatcher(None, vendor, b_vendor).ratio()
+            if score >= 0.4:
+                parts.append(f'Vendor ({score:.0%})')
+        return ' | '.join(parts) if parts else 'matched'
+
     # Pass 1: check number
     for row in intact_rows:
         ck = str(row.get('check_no', '')).strip()
@@ -895,7 +914,7 @@ def match_intact_to_bank(intact_rows, bank_txns):
         if ck and ck in bank_txns:
             b = bank_txns[ck]
             if id(b) not in used_bank and (amt is None or abs(b['amount'] - amt) < 0.02):
-                matched.append({'intact_row': row, 'bank': b, 'match_type': 'check_no'})
+                matched.append({'intact_row': row, 'bank': b, 'match_type': _criteria(row, b)})
                 used_bank.add(id(b))
 
     matched_intact = {id(m['intact_row']) for m in matched}
@@ -917,7 +936,7 @@ def match_intact_to_bank(intact_rows, bank_txns):
                 if score > best_score:
                     best_score, best_b = score, b
         if best_b and best_score >= 0.4:
-            matched.append({'intact_row': row, 'bank': best_b, 'match_type': f'amount+vendor ({best_score:.0%})'})
+            matched.append({'intact_row': row, 'bank': best_b, 'match_type': _criteria(row, best_b, best_score)})
             used_bank.add(id(best_b))
             matched_intact.add(id(row))
 
@@ -932,7 +951,7 @@ def match_intact_to_bank(intact_rows, bank_txns):
             if id(b) in used_bank:
                 continue
             if abs(b['amount'] - amt) < 0.02:
-                matched.append({'intact_row': row, 'bank': b, 'match_type': 'amount only'})
+                matched.append({'intact_row': row, 'bank': b, 'match_type': _criteria(row, b)})
                 used_bank.add(id(b))
                 matched_intact.add(id(row))
                 break
