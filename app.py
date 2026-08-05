@@ -622,6 +622,85 @@ def build_flags_excel(meta, recon_rows):
         ws2.column_dimensions[get_column_letter(i)].width = w
     ws2.freeze_panes = "A3"
 
+    # ── Sheet 3: By Day ───────────────────────────────────────────────────────
+    ws3 = wb.create_sheet("By Day")
+    ws3.merge_cells("A1:L1")
+    ws3["A1"] = f"Daily Summary — {meta.get('facility','')}"
+    ws3["A1"].font = Font(name="Arial", bold=True, size=11, color="1F4E79")
+    ws3.row_dimensions[1].height = 20
+
+    day_hdrs = ["Date","Shifts","Inv Hrs","Emp Hrs","Hrs Diff",
+                "Match","No Punch","Overbilled","Underbilled","Time Diff","Other","Late Cancel"]
+    for ci, h in enumerate(day_hdrs, 1):
+        c = ws3.cell(row=2, column=ci, value=h)
+        c.font = S['HFONT']; c.fill = S['HDR_F']; c.alignment = S['CTR']
+    ws3.row_dimensions[2].height = 16
+
+    # Group rows by date
+    from collections import defaultdict
+    day_map = defaultdict(list)
+    for r in recon_rows:
+        day_map[r['date']].append(r)
+
+    ri3 = 3
+    for day in sorted(day_map.keys(), key=lambda d: (d or '')):
+        day_rows = day_map[day]
+        inv_hrs  = round(sum(r['inv_hrs'] for r in day_rows if not r.get('lc')), 2)
+        emp_hrs  = round(sum(r['e_adj'] for r in day_rows if r['e_adj'] is not None), 2)
+        hrs_diff = round(sum(r['hrs_diff'] for r in day_rows if r.get('hrs_diff') is not None), 2)
+        n_match  = sum(1 for r in day_rows if r['flag'] == 'MATCH')
+        n_np     = sum(1 for r in day_rows if 'NO PUNCH' in r['flag'])
+        n_over   = sum(1 for r in day_rows if 'OVERBILLED' in r['flag'])
+        n_under  = sum(1 for r in day_rows if 'UNDERBILLED' in r['flag'])
+        n_td     = sum(1 for r in day_rows if 'TIME DIFF' in r['flag'])
+        n_lc     = sum(1 for r in day_rows if r['flag'] == 'LATE CANCEL')
+        n_other  = len(day_rows) - n_match - n_np - n_over - n_under - n_td - n_lc
+        n_other  = max(n_other, 0)
+
+        # Row background: red if any flags, green if all match
+        if n_np or n_over:
+            row_fill3 = S['RED_F']
+        elif n_under or n_td or n_other:
+            row_fill3 = S['YLW_F']
+        else:
+            row_fill3 = S['GRN_F']
+
+        vals = [day, len(day_rows), inv_hrs, emp_hrs, hrs_diff,
+                n_match, n_np, n_over, n_under, n_td, n_other, n_lc]
+        for ci, val in enumerate(vals, 1):
+            c = ws3.cell(row=ri3, column=ci, value=val)
+            c.fill = row_fill3; c.alignment = S['CTR']; c.font = S['NF']
+            if ci == 1: c.font = S['BF']
+            if ci == 5 and val:  # hrs diff — color negative/positive
+                c.number_format = "+0.00;-0.00;0.00"
+                c.font = S['RF'] if val > 0.05 else (S['BLF'] if val < -0.05 else S['NF'])
+        ws3.row_dimensions[ri3].height = 16
+        ri3 += 1
+
+    # Totals row
+    all_inv  = round(sum(r['inv_hrs'] for r in recon_rows if not r.get('lc')), 2)
+    all_emp  = round(sum(r['e_adj'] for r in recon_rows if r['e_adj'] is not None), 2)
+    all_diff = round(sum(r['hrs_diff'] for r in recon_rows if r.get('hrs_diff') is not None), 2)
+    tot_vals = ["TOTAL", len(recon_rows), all_inv, all_emp, all_diff,
+                sum(1 for r in recon_rows if r['flag']=='MATCH'),
+                sum(1 for r in recon_rows if 'NO PUNCH' in r['flag']),
+                sum(1 for r in recon_rows if 'OVERBILLED' in r['flag']),
+                sum(1 for r in recon_rows if 'UNDERBILLED' in r['flag']),
+                sum(1 for r in recon_rows if 'TIME DIFF' in r['flag']),
+                0, sum(1 for r in recon_rows if r['flag']=='LATE CANCEL')]
+    TOT_F = PatternFill("solid", start_color="2E75B6")
+    for ci, val in enumerate(tot_vals, 1):
+        c = ws3.cell(row=ri3, column=ci, value=val)
+        c.fill = TOT_F; c.alignment = S['CTR']
+        c.font = Font(name="Arial", bold=True, size=9, color="FFFFFF")
+        if ci == 5 and val: c.number_format = "+0.00;-0.00;0.00"
+    ws3.row_dimensions[ri3].height = 18
+
+    col_widths3 = [10, 7, 9, 9, 9, 8, 9, 10, 11, 10, 7, 11]
+    for i, w in enumerate(col_widths3, 1):
+        ws3.column_dimensions[get_column_letter(i)].width = w
+    ws3.freeze_panes = "A3"
+
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     return buf.read()
 
@@ -1230,23 +1309,34 @@ with tab2:
 with tab1:
     col1, col2 = st.columns(2)
     with col1:
-        pdf_file  = st.file_uploader("Invoice PDF (Clipboard or ShiftKey)", type="pdf")
+        pdf_files = st.file_uploader("Invoice PDF(s) (Clipboard or ShiftKey — upload one or more)",
+                                      type="pdf", accept_multiple_files=True)
     with col2:
         xlsx_file = st.file_uploader("Empion Punch Report (Excel)", type=["xlsx", "xls"])
 
-    if pdf_file and xlsx_file:
+    if pdf_files and xlsx_file:
         if st.button("Run Reconciliation", type="primary", use_container_width=True):
-            with st.spinner("Detecting vendor and parsing invoice..."):
-                meta, shifts = parse_invoice(pdf_file.read())
-                vendor = meta.get('vendor', 'Clipboard')
+            all_shifts = []
+            all_metas  = []
+            with st.spinner("Detecting vendor and parsing invoices..."):
+                for pf in pdf_files:
+                    m, s = parse_invoice(pf.read())
+                    all_metas.append(m)
+                    all_shifts.extend(s)
             with st.spinner("Parsing Empion punches..."):
                 emp_idx = parse_empion(xlsx_file.read())
             with st.spinner("Reconciling..."):
-                recon_rows, name_notes = reconcile(shifts, emp_idx)
+                recon_rows, name_notes = reconcile(all_shifts, emp_idx)
+
+            # Build combined header info
+            vendors   = ', '.join(sorted({m.get('vendor','Clipboard') for m in all_metas}))
+            invoices  = ', '.join(m['invoice'] for m in all_metas if m.get('invoice'))
+            facility  = all_metas[0].get('facility', '')
+            total_due = sum(m.get('balance_due', 0) or 0 for m in all_metas)
 
             st.divider()
-            st.subheader(f"{vendor} Invoice {meta['invoice']} -- {meta['facility']}")
-            st.caption(f"Period: {meta['period_start']} - {meta['period_end']}  |  Balance Due: ${meta['balance_due']:,.2f}")
+            st.subheader(f"{vendors} — {len(pdf_files)} Invoice{'s' if len(pdf_files)>1 else ''}: {invoices}")
+            st.caption(f"Facility: {facility}  |  Combined Balance Due: ${total_due:,.2f}")
 
             total_items = len(recon_rows)
             n_match  = sum(1 for r in recon_rows if r['flag'] == 'MATCH')
