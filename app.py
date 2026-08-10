@@ -189,11 +189,17 @@ def parse_empion(xlsx_bytes):
     try:
         wb = load_workbook(tmp_path, data_only=True)
         ws = wb.active
-        hdr = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        name_col = hdr.index('Full Name')
-        in_col   = hdr.index('In Time')
-        out_col  = hdr.index('Out Time')
-        hrs_col  = hdr.index('Total Hours')
+        hdr = [str(c.value).strip() if c.value is not None else '' for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        def find_col(*candidates):
+            for h in hdr:
+                for cand in candidates:
+                    if cand.lower() in h.lower():
+                        return hdr.index(h)
+            raise ValueError(f"Could not find column matching {candidates} in headers: {hdr}")
+        name_col = find_col('Full Name', 'Employee Name', 'Name')
+        in_col   = find_col('In Time', 'Clock In', 'Punch In')
+        out_col  = find_col('Out Time', 'Clock Out', 'Punch Out')
+        hrs_col  = find_col('Total Hours', 'Hours', 'Reg Hours')
         raw = []
         for row in ws.iter_rows(min_row=2, values_only=True):
             fn = row[name_col]; it = row[in_col]; ot = row[out_col]; rh = row[hrs_col]
