@@ -11,9 +11,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-st.set_page_config(page_title="Brighton Healthcare Tools", layout="wide")
-st.title("Brighton Healthcare Tools")
-st.caption("Staffing invoice reconciliation and AP bank reconciliation tools.")
+st.set_page_config(page_title="Reconciliation Tools", layout="wide")
+st.title("Reconciliation Tools")
+st.caption("Staffing invoice reconciliation and AP bank reconciliation.")
 st.info(
     "🔒 **Privacy:** Uploaded files are processed in memory only and never stored. "
     "All data is discarded when you close the browser or upload new files. "
@@ -410,7 +410,7 @@ def build_hours_excel(meta, shifts):
     wb = Workbook(); ws = wb.active; ws.title = "Hours by Day"
     ncols = 2 + len(all_dates) + 2
     ws.merge_cells(f"A1:{get_column_letter(ncols)}1")
-    ws["A1"] = f"Clipboard Invoice {meta['invoice']} — {meta['facility']} — {meta['period_start']}–{meta['period_end']}"
+    ws["A1"] = f"Invoice {meta['invoice']} — {meta['facility']} — {meta['period_start']}–{meta['period_end']}"
     ws["A1"].font = Font(name="Arial", bold=True, size=12, color="1F4E79")
     ws.row_dimensions[1].height = 22
 
@@ -540,7 +540,7 @@ def build_flags_excel(meta, recon_rows):
     ws1.row_dimensions[5].height = 6
 
     # Column headers (shifted down by 4 rows)
-    for ci, h in enumerate(["Date","Employee","Role","Issue","Invoice In","Invoice Out","Empion In","Empion Out","Notes"], 1):
+    for ci, h in enumerate(["Date","Employee","Role","Issue","Invoice In","Invoice Out","Punch In","Punch Out","Notes"], 1):
         c = ws1.cell(row=6, column=ci, value=h)
         c.font = S['HFONT']; c.fill = S['HDR_F']; c.alignment = S['CTR']
     ws1.row_dimensions[6].height = 16
@@ -576,12 +576,12 @@ def build_flags_excel(meta, recon_rows):
     # ── Sheet 2: Punch-for-Punch ──────────────────────────────────────────
     ws2 = wb.create_sheet("Punch-for-Punch")
     ws2.merge_cells("A1:P1")
-    ws2["A1"] = f"Invoice {meta['invoice']} — {meta['facility']} — Full Punch-for-Punch vs Empion"
+    ws2["A1"] = f"Invoice {meta['invoice']} — {meta['facility']} — Full Punch-for-Punch"
     ws2["A1"].font = Font(name="Arial", bold=True, size=11, color="1F4E79")
     ws2.row_dimensions[1].height = 20
 
     for ci, h in enumerate(["Date","Employee","Role","Shift","Inv Start","Inv End","Inv Gross","Inv Billed",
-                             "Emp In","Emp Out","Emp Raw","Emp Adj","Start Δ(min)","End Δ(min)","Hrs Diff","Flag / Notes"], 1):
+                             "Punch In","Punch Out","Raw Hrs","Adj Hrs","Start Δ(min)","End Δ(min)","Hrs Diff","Flag / Notes"], 1):
         c = ws2.cell(row=2, column=ci, value=h)
         c.font = S['HFONT']; c.fill = S['HDR_F']
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -1309,10 +1309,10 @@ with tab2:
 with tab1:
     col1, col2 = st.columns(2)
     with col1:
-        pdf_files = st.file_uploader("Invoice PDF(s) (Clipboard or ShiftKey — upload one or more)",
+        pdf_files = st.file_uploader("Invoice PDF(s) — upload one or more",
                                       type="pdf", accept_multiple_files=True)
     with col2:
-        xlsx_file = st.file_uploader("Empion Punch Report (Excel)", type=["xlsx", "xls"])
+        xlsx_file = st.file_uploader("Punch Report (Excel)", type=["xlsx", "xls"])
 
     if pdf_files and xlsx_file:
         if st.button("Run Reconciliation", type="primary", use_container_width=True):
@@ -1323,7 +1323,7 @@ with tab1:
                     m, s = parse_invoice(pf.read())
                     all_metas.append(m)
                     all_shifts.extend(s)
-            with st.spinner("Parsing Empion punches..."):
+            with st.spinner("Parsing punch report..."):
                 emp_idx = parse_empion(xlsx_file.read())
             with st.spinner("Reconciling..."):
                 recon_rows, name_notes = reconcile(all_shifts, emp_idx)
@@ -1361,7 +1361,7 @@ with tab1:
 
             hc1, hc2, hc3, hc4 = st.columns(4)
             hc1.metric("Total Invoice Hours", f"{total_inv_hrs:.2f}h")
-            hc2.metric("Total Empion Hours",  f"{total_emp_hrs:.2f}h")
+            hc2.metric("Total Punch Hours",  f"{total_emp_hrs:.2f}h")
             disc_str = f"{punch_disc_hrs:+.2f}h"
             hc3.metric("Punch Discrepancy",   disc_str, delta=disc_str)
             hc4.metric("Missing Punch Hours", f"{missing_hrs:.2f}h")
